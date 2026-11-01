@@ -12,9 +12,10 @@ DATABASE_URL = os.getenv("DATABASE_URL", "")
 SECRET_WORD = os.getenv("SECRET_WORD", "Зенит")
 
 # Категории лотов на lzt.market, которые разрешено покупать.
+# Точные значения — из официальной документации Market API.
 # ВАЖНО: категории "stealer" (стиллер) и "phishing" (фишинг) никогда
 # не добавлять сюда — это угнанные у реальных людей аккаунты.
-ALLOWED_ORIGINS = ["resale", "autoreg", "selfreg"]
+ALLOWED_ORIGINS = ["resale", "autoreg", "self_registration"]
 
 # Значения по умолчанию — дальше их можно менять прямо в боте
 DEFAULTS = {
