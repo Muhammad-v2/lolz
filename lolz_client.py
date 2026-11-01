@@ -27,22 +27,22 @@ class LolzClient:
         await self._client.aclose()
 
     async def search_telegram_accounts(self, price_min: float, price_max: float,
-                                        min_session_hours: int = 24):
+                                        spam: str = "nomatter", password: str = "no",
+                                        session_age_value: int = 1, session_age_period: str = "day"):
         """
         Ищет лоты Telegram-аккаунтов по цене, разрешённым категориям
-        происхождения и возрасту сессии.
-        min_session_hours округляется до суток, т.к. API принимает
-        возраст сессии только в днях/месяцах/годах (session_age_period).
+        происхождения и остальным фильтрам (спам-блок, пароль, возраст сессии) —
+        как на сайте lzt.market.
         """
-        session_days = max(1, round(min_session_hours / 24))
         params = {
             "pmin": price_min,
             "pmax": price_max,
             "origin[]": ALLOWED_ORIGINS,
             "order_by": "price_to_up",
-            "password": "no",              # без облачного пароля
-            "session_age": session_days,
-            "session_age_period": "day",
+            "spam": spam,
+            "password": password,
+            "session_age": session_age_value,
+            "session_age_period": session_age_period,
         }
         resp = await self._client.get("/telegram", params=params)
         if resp.status_code != 200:
