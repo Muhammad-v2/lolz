@@ -1,14 +1,17 @@
 """
 Обёртка над Lolz (lzt.market) Market API через httpx.
 
-ВАЖНО: перед первым запуском свериться с официальной документацией
-https://docs.api.zelenka.guru/market/ — названия некоторых параметров
-могли поменяться. Места, которые стоит перепроверить, помечены TODO.
+Сверено с официальной документацией:
+https://lzt-market.readme.io/reference/information
+
+Места, которые всё ещё стоит проверить на реальных данных (TODO),
+касаются только структуры ответа API при покупке/продаже — сами
+параметры запросов уже сверены с документацией.
 """
 import httpx
-from config import LOLZ_TOKEN, ALLOWED_ORIGINS, SECRET_WORD
+from config import LOLZ_TOKEN, ALLOWED_ORIGINS
 
-BASE_URL = "https://prod-api.lzt.market"
+BASE_URL = "https://api.lzt.market"
 
 
 class LolzError(Exception):
@@ -17,16 +20,8 @@ class LolzError(Exception):
 
 class LolzClient:
     def __init__(self, token: str = LOLZ_TOKEN):
-        self._token = token
         self._headers = {"Authorization": f"Bearer {token}"}
-        self._client = httpx.AsyncClient(base_url=BASE_URL, headers=self._headers, timeout=30)
-
-    def _with_token(self, params: dict) -> dict:
-        """На случай, если заголовок Authorization не сработает — дублируем
-        токен как query-параметр oauth_token (второй вариант авторизации по доке)."""
-        params = dict(params)
-        params["oauth_token"] = self._token
-        return params
+        self._client = httpx.AsyncClient(base_url=BASE_URL, headers=self._headers, timeout=300)
 
     async def close(self):
         await self._client.aclose()
@@ -34,73 +29,66 @@ class LolzClient:
     async def search_telegram_accounts(self, price_min: float, price_max: float,
                                         min_session_hours: int = 24):
         """
-        Ищет лоты Telegram-аккаунтов по цене и разрешённым категориям
-        происхождения (resale / autoreg / selfreg).
-        Возвращает список найденных лотов (сырые словари из API).
+        Ищет лоты Telegram-аккаунтов по цене, разрешённым категориям
+        происхождения и возрасту сессии.
+        min_session_hours округляется до суток, т.к. API принимает
+        возраст сессии только в днях/месяцах/годах (session_age_period).
         """
+        session_days = max(1, round(min_session_hours / 24))
         params = {
             "pmin": price_min,
             "pmax": price_max,
-            "origin[]": ALLOWED_ORIGINS,   # TODO: сверить точное имя параметра
+            "origin[]": ALLOWED_ORIGINS,
             "order_by": "price_to_up",
-            "nsb": 1,   # TODO: "без спам-блока" — если неверно, убрать
+            "password": "no",              # без облачного пароля
+            "session_age": session_days,
+            "session_age_period": "day",
         }
-        resp = await self._client.get("/telegram", params=self._with_token(params))
+        resp = await self._client.get("/telegram", params=params)
         if resp.status_code != 200:
             raise LolzError(f"Поиск не удался ({resp.status_code}): {resp.text}")
         data = resp.json()
-        items = data.get("items", [])
-
-        # Доп. фильтрация на нашей стороне — по возрасту последней сессии
-        # и отсутствию пароля, на случай если API не поддержит эти фильтры напрямую.
-        filtered = []
-        for item in items:
-            if item.get("telegram_has_password"):
-                continue
-            session_hours = item.get("telegram_last_online_hours") or item.get("session_hours")
-            if session_hours is not None and session_hours < min_session_hours:
-                continue
-            origin = item.get("origin")
-            if origin and origin not in ALLOWED_ORIGINS:
-                continue
-            filtered.append(item)
-        return filtered
+        return data.get("items", [])
 
     async def buy_item(self, item_id: int, price: float):
-        """
-        Быстрая покупка лота по фиксированной цене.
-        Если на аккаунте стоит секретное слово — передаём его.
-        """
-        payload = {
-            "price": price,
-            "secret_answer": SECRET_WORD,  # TODO: сверить имя поля в доке "fast-buy"
-        }
+        """Быстрая покупка лота по фиксированной цене (эндпоинт /{item_id}/fast-buy)."""
+        payload = {"price": price}
         resp = await self._client.post(f"/{item_id}/fast-buy", data=payload)
         if resp.status_code != 200:
             raise LolzError(f"Покупка не удалась ({resp.status_code}): {resp.text}")
         return resp.json()
 
     async def get_item_login_data(self, item_id: int):
-        """Возвращает данные для входа в купленный аккаунт (сессию/tdata/json)."""
+        """Возвращает данные для входа в купленный аккаунт."""
         resp = await self._client.get(f"/{item_id}")
         if resp.status_code != 200:
             raise LolzError(f"Не удалось получить данные лота ({resp.status_code}): {resp.text}")
         return resp.json()
 
     async def list_for_sale(self, title: str, price: float, description: str,
-                             buyer_note: str, hex_key: str, dc_id: int):
+                             information: str, hex_key: str, dc_id: int):
         """
-        Выставляет новый товар (Telegram-аккаунт) на продажу в категории "перепродажа".
+        Выставляет новый товар (Telegram-аккаунт) на продажу через
+        эндпоинт /item/fast-sell. category_id=24 — это Telegram
+        (список категорий из документации).
+
+        TODO: поле extra для передачи HEX/DC не описано в общей
+        схеме (видимо, зависит от категории) — нужно свериться по
+        реальному ответу от /item/fast-sell либо по разделу
+        "Check Account Details" для категории Telegram.
         """
         payload = {
             "title": title,
             "price": price,
+            "category_id": 24,  # Telegram
+            "currency": "rub",
             "item_origin": "resale",
-            "item_description": description,
-            "extended_description": buyer_note,   # TODO: сверить имя поля
-            "telegram_auth": f"{hex_key}:{dc_id}",  # TODO: сверить формат поля HEX:DC
+            "description": description,
+            "information": information,
+            "extra[auth_key]": hex_key,
+            "extra[dc_id]": dc_id,
         }
-        resp = await self._client.post("/telegram", data=payload)
+        resp = await self._client.post("/item/fast-sell", data=payload)
         if resp.status_code != 200:
             raise LolzError(f"Не удалось выставить лот ({resp.status_code}): {resp.text}")
         return resp.json()
