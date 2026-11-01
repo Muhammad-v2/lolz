@@ -22,6 +22,7 @@ class Worker:
         self.send_log = send_log  # async fn(text) -> отправка сообщения админу
         self.lolz = LolzClient()
         self._running = False
+        self._empty_streak = 0  # сколько подряд поисков без результата
 
     async def stop(self):
         self._running = False
@@ -39,10 +40,22 @@ class Worker:
             interval = int(await db.get_setting("search_interval_sec"))
             await asyncio.sleep(interval)
 
+    @staticmethod
+    def _find_first_str(data: dict, keys: list):
+        """Возвращает первое непустое строковое/числовое значение из data по списку
+        возможных имён поля — нужно, т.к. точное имя поля в ответе API не подтверждено."""
+        if not isinstance(data, dict):
+            return None
+        for k in keys:
+            v = data.get(k)
+            if v not in (None, ""):
+                return v
+        return None
+
     async def _tick(self):
         remaining = await db.queue_remaining()
         if remaining <= 0:
-            return
+            return  # в очереди пусто — нечего искать, молчим
 
         daily_limit = float(await db.get_setting("daily_limit"))
         spent_today = await db.get_today_spent()
@@ -66,7 +79,16 @@ class Worker:
             session_age_value=session_age_value, session_age_period=session_age_period,
         )
         if not items:
+            self._empty_streak += 1
+            # пишем раз в ~10 циклов, чтобы не заваливать сообщениями, но
+            # было видно, что бот жив и действительно ищет
+            if self._empty_streak % 10 == 1:
+                await self.send_log(
+                    f"🔍 Искал подходящие аккаунты ({self._empty_streak} раз подряд) — "
+                    f"пока ничего не нашёл. В очереди: {remaining}"
+                )
             return
+        self._empty_streak = 0
 
         item = items[0]
         item_id = item["item_id"]
@@ -78,6 +100,17 @@ class Worker:
 
         try:
             await self._buy_and_process(item_id, price, item)
+        except LolzError as e:
+            msg = str(e)
+            if "продан" in msg.lower() or "sold" in msg.lower():
+                # лот купили раньше нас — это гонка, не ошибка.
+                # возвращаем попытку в очередь и пробуем снова на следующем цикле.
+                await db.queue_add(1)
+                await self.send_log(f"ℹ️ Лот #{item_id} уже купили раньше нас, пробую другой")
+                return
+            log.exception("Ошибка обработки лота %s", item_id)
+            await db.update_purchase_status(item_id, "error", msg)
+            await self.send_log(f"❌ Ошибка обработки аккаунта #{item_id}: {msg}")
         except Exception as e:
             log.exception("Ошибка обработки лота %s", item_id)
             await db.update_purchase_status(item_id, "error", str(e))
@@ -88,11 +121,21 @@ class Worker:
         bought = await self.lolz.buy_item(item_id, price)
         await db.add_spent(price)
 
-        login_data = await self.lolz.get_item_login_data(item_id)
-        session_str = login_data.get("telethon_session") or login_data.get("session")
-        phone = login_data.get("phone") or item.get("phone")
-        country = item.get("item_origin_country") or item.get("country", "—")
-        country_code = item.get("phone_country_code") or ""
+        # Ответ /{item_id}/fast-buy может сам содержать данные для входа.
+        # Если нет — дополнительно запрашиваем карточку лота.
+        login_data = bought
+        if "item" in bought and isinstance(bought["item"], dict):
+            login_data = {**bought, **bought["item"]}
+
+        session_str = self._find_first_str(login_data, [
+            "telethon_session", "session", "login_session", "tdata", "string_session",
+        ])
+        phone = self._find_first_str(login_data, ["phone", "telegram_phone", "login"]) \
+            or self._find_first_str(item, ["phone", "telegram_phone"])
+        country = self._find_first_str(login_data, ["country", "item_origin_country"]) \
+            or self._find_first_str(item, ["country", "item_origin_country"]) or "—"
+        country_code = self._find_first_str(login_data, ["phone_country_code", "country_code"]) \
+            or self._find_first_str(item, ["phone_country_code", "country_code"]) or ""
 
         await db.add_purchase(item_id, price, phone, country, country_code)
         await self.send_log(
@@ -103,7 +146,13 @@ class Worker:
 
         if not session_str:
             await db.update_purchase_status(item_id, "error", "Нет данных сессии от Lolz")
-            await self.send_log(f"❌ #{item_id}: не получены данные сессии, остановлен")
+            # Полный сырой ответ — чтобы понять, как реально называется поле
+            # с данными для входа, и поправить код под точный формат.
+            raw = str(bought)[:3500]
+            await self.send_log(
+                f"❌ #{item_id}: не получены данные сессии, остановлен.\n"
+                f"Сырой ответ API (пришли мне этот текст):\n{raw}"
+            )
             return
 
         bought_client = await connect_from_string_session(session_str)
