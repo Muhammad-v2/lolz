@@ -5,10 +5,9 @@
 """
 import asyncio
 import logging
-from config import ALLOWED_ORIGINS
 from lolz_client import LolzClient, LolzError
 from telethon_actions import (
-    connect_from_string_session, terminate_other_sessions,
+    connect_from_hex_dc, terminate_other_sessions,
     create_new_session, get_auth_hex_and_dc, terminate_this_session,
     cleanup_account, AccountPipelineError,
 )
@@ -22,7 +21,6 @@ class Worker:
         self.send_log = send_log  # async fn(text) -> отправка сообщения админу
         self.lolz = LolzClient()
         self._running = False
-        self._empty_streak = 0  # сколько подряд поисков без результата
 
     async def stop(self):
         self._running = False
@@ -30,30 +28,18 @@ class Worker:
 
     async def run_forever(self):
         self._running = True
-        interval = int(await db.get_setting("search_interval_sec"))
         while self._running:
             try:
-                await self._tick()
+                if await db.is_enabled():
+                    await self._tick()
             except Exception as e:
                 log.exception("Ошибка в рабочем цикле")
                 await self.send_log(f"⚠️ Ошибка в рабочем цикле: {e}")
             interval = int(await db.get_setting("search_interval_sec"))
             await asyncio.sleep(interval)
 
-    @staticmethod
-    def _find_first_str(data: dict, keys: list):
-        """Возвращает первое непустое строковое/числовое значение из data по списку
-        возможных имён поля — нужно, т.к. точное имя поля в ответе API не подтверждено."""
-        if not isinstance(data, dict):
-            return None
-        for k in keys:
-            v = data.get(k)
-            if v not in (None, ""):
-                return v
-        return None
-
     async def _tick(self):
-        remaining = await db.queue_remaining()
+        remaining = await db.get_queue()
         if remaining <= 0:
             return  # в очереди пусто — нечего искать, молчим
 
@@ -79,16 +65,7 @@ class Worker:
             session_age_value=session_age_value, session_age_period=session_age_period,
         )
         if not items:
-            self._empty_streak += 1
-            # пишем раз в ~10 циклов, чтобы не заваливать сообщениями, но
-            # было видно, что бот жив и действительно ищет
-            if self._empty_streak % 10 == 1:
-                await self.send_log(
-                    f"🔍 Искал подходящие аккаунты ({self._empty_streak} раз подряд) — "
-                    f"пока ничего не нашёл. В очереди: {remaining}"
-                )
             return
-        self._empty_streak = 0
 
         item = items[0]
         item_id = item["item_id"]
@@ -103,9 +80,7 @@ class Worker:
         except LolzError as e:
             msg = str(e)
             if "продан" in msg.lower() or "sold" in msg.lower():
-                # лот купили раньше нас — это гонка, не ошибка.
-                # возвращаем попытку в очередь и пробуем снова на следующем цикле.
-                await db.queue_add(1)
+                await db.add_queue(1)  # вернуть попытку в очередь, лот купили раньше нас
                 await self.send_log(f"ℹ️ Лот #{item_id} уже купили раньше нас, пробую другой")
                 return
             log.exception("Ошибка обработки лота %s", item_id)
@@ -118,44 +93,33 @@ class Worker:
 
     async def _buy_and_process(self, item_id: int, price: float, item: dict):
         await self.send_log(f"🛒 Покупаю лот #{item_id} за {price}₽...")
-        bought = await self.lolz.buy_item(item_id, price)
+        await self.lolz.buy_item(item_id, price)
         await db.add_spent(price)
 
-        # Ответ /{item_id}/fast-buy может сам содержать данные для входа.
-        # Если нет — дополнительно запрашиваем карточку лота.
-        login_data = bought
-        if "item" in bought and isinstance(bought["item"], dict):
-            login_data = {**bought, **bought["item"]}
+        data = await self.lolz.get_item_login_data(item_id)
 
-        session_str = self._find_first_str(login_data, [
-            "telethon_session", "session", "login_session", "tdata", "string_session",
-        ])
-        phone = self._find_first_str(login_data, ["phone", "telegram_phone", "login"]) \
-            or self._find_first_str(item, ["phone", "telegram_phone"])
-        country = self._find_first_str(login_data, ["country", "item_origin_country"]) \
-            or self._find_first_str(item, ["country", "item_origin_country"]) or "—"
-        country_code = self._find_first_str(login_data, ["phone_country_code", "country_code"]) \
-            or self._find_first_str(item, ["phone_country_code", "country_code"]) or ""
+        hex_key_bought = data.get("login")
+        dc_id_bought = data.get("telegram_dc_id")
+        phone = data.get("telegram_phone")
+        country = data.get("telegram_country") or "—"
+        country_code = (data.get("phone") or "").split()[0] if data.get("phone") else ""
 
         await db.add_purchase(item_id, price, phone, country, country_code)
         await self.send_log(
             f"✅ Куплен аккаунт #{item_id}\n"
             f"Телефон: {phone}\nСтрана: {country}\nЦена: {price}₽\n"
-            f"Дата регистрации: {item.get('reg_date', '—')}"
+            f"User ID: {data.get('telegram_id', '—')}"
         )
 
-        if not session_str:
-            await db.update_purchase_status(item_id, "error", "Нет данных сессии от Lolz")
-            # Полный сырой ответ — чтобы понять, как реально называется поле
-            # с данными для входа, и поправить код под точный формат.
-            raw = str(bought)[:3500]
+        if not hex_key_bought or not dc_id_bought:
+            await db.update_purchase_status(item_id, "error", "Нет HEX/DC от Lolz")
+            raw = str(data)[:3500]
             await self.send_log(
-                f"❌ #{item_id}: не получены данные сессии, остановлен.\n"
-                f"Сырой ответ API (пришли мне этот текст):\n{raw}"
+                f"❌ #{item_id}: не получены HEX/DC, остановлен.\nСырой ответ:\n{raw}"
             )
             return
 
-        bought_client = await connect_from_string_session(session_str)
+        bought_client = await connect_from_hex_dc(hex_key_bought, int(dc_id_bought))
         try:
             await terminate_other_sessions(bought_client)
             await db.update_purchase_status(item_id, "sessions_terminated")
@@ -181,8 +145,7 @@ class Worker:
                 sell_price = float(await db.get_setting("sell_price"))
                 title_tpl = await db.get_setting("title_template")
                 title = title_tpl.format(code=country_code or "?", country=country)
-                # "description" — публичное описание (видят все до покупки);
-                # "information" — приватная инфа, видна только покупателю после оплаты.
+
                 after_purchase_note = await db.get_setting("sell_description")
                 buyer_note = await db.get_setting("sell_buyer_note")
                 information = f"{after_purchase_note}\n{buyer_note}"
