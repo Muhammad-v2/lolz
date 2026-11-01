@@ -17,8 +17,16 @@ class LolzError(Exception):
 
 class LolzClient:
     def __init__(self, token: str = LOLZ_TOKEN):
+        self._token = token
         self._headers = {"Authorization": f"Bearer {token}"}
         self._client = httpx.AsyncClient(base_url=BASE_URL, headers=self._headers, timeout=30)
+
+    def _with_token(self, params: dict) -> dict:
+        """На случай, если заголовок Authorization не сработает — дублируем
+        токен как query-параметр oauth_token (второй вариант авторизации по доке)."""
+        params = dict(params)
+        params["oauth_token"] = self._token
+        return params
 
     async def close(self):
         await self._client.aclose()
@@ -37,8 +45,9 @@ class LolzClient:
             "order_by": "price_to_up",
             "nsb": 1,   # TODO: "без спам-блока" — если неверно, убрать
         }
-        resp = await self._client.get("/telegram", params=params)
-        resp.raise_for_status()
+        resp = await self._client.get("/telegram", params=self._with_token(params))
+        if resp.status_code != 200:
+            raise LolzError(f"Поиск не удался ({resp.status_code}): {resp.text}")
         data = resp.json()
         items = data.get("items", [])
 
@@ -74,7 +83,8 @@ class LolzClient:
     async def get_item_login_data(self, item_id: int):
         """Возвращает данные для входа в купленный аккаунт (сессию/tdata/json)."""
         resp = await self._client.get(f"/{item_id}")
-        resp.raise_for_status()
+        if resp.status_code != 200:
+            raise LolzError(f"Не удалось получить данные лота ({resp.status_code}): {resp.text}")
         return resp.json()
 
     async def list_for_sale(self, title: str, price: float, description: str,
@@ -97,6 +107,7 @@ class LolzClient:
 
     async def get_balance(self) -> float:
         resp = await self._client.get("/me")
-        resp.raise_for_status()
+        if resp.status_code != 200:
+            raise LolzError(f"Не удалось получить баланс ({resp.status_code}): {resp.text}")
         data = resp.json()
         return float(data.get("user", {}).get("balance", 0))
