@@ -24,10 +24,11 @@ dp.message.filter(F.from_user.id == ADMIN_ID)
 
 MAIN_MENU = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="📊 Статус"), KeyboardButton(text="🛒 Купить аккаунты")],
+        [KeyboardButton(text="📊 Статус"), KeyboardButton(text="🛒 Очередь покупок")],
         [KeyboardButton(text="💰 Лимит в день"), KeyboardButton(text="📥 Цена покупки")],
         [KeyboardButton(text="📤 Цена продажи"), KeyboardButton(text="📝 Шаблон заголовка")],
         [KeyboardButton(text="⏱ Интервал поиска"), KeyboardButton(text="🎛 Фильтры поиска")],
+        [KeyboardButton(text="⏸ Пауза"), KeyboardButton(text="▶️ Запустить")],
         [KeyboardButton(text="❌ Отмена")],
     ],
     resize_keyboard=True,
@@ -100,10 +101,12 @@ async def cmd_cancel(message: Message, state: FSMContext):
 async def show_status(message: Message):
     settings = await db.get_settings()
     spent = await db.get_today_spent()
-    remaining = await db.queue_remaining()
+    remaining = await db.get_queue()
+    enabled = await db.is_enabled()
     purchases = await db.recent_purchases(5)
 
     lines = [
+        f"Состояние: {'▶️ работает' if enabled else '⏸ на паузе'}",
         f"Потрачено сегодня: {spent}₽ из {settings.get('daily_limit')}₽",
         f"В очереди на покупку: {remaining}",
         f"Цена покупки: {settings.get('buy_min_price')}–{settings.get('buy_max_price')}₽",
@@ -120,23 +123,51 @@ async def show_status(message: Message):
     await message.answer("\n".join(lines), reply_markup=MAIN_MENU)
 
 
-# ---------- Купить аккаунты ----------
+# ---------- Очередь покупок ----------
 
-@dp.message(F.text == "🛒 Купить аккаунты")
+@dp.message(F.text == "🛒 Очередь покупок")
 async def ask_buy_count(message: Message, state: FSMContext):
+    current = await db.get_queue()
     await state.set_state(Form.buy_count)
-    await message.answer("Сколько аккаунтов купить? Напиши число.", reply_markup=CANCEL_KB)
+    await message.answer(
+        f"Сейчас в очереди: {current}\n\n"
+        f"Напиши число, чтобы ДОБАВИТЬ (например 3), "
+        f"или со знаком минус, чтобы УБАВИТЬ (например -2).\n"
+        f"Чтобы обнулить очередь — напиши 0=0",
+        reply_markup=CANCEL_KB,
+    )
 
 
 @dp.message(StateFilter(Form.buy_count))
 async def set_buy_count(message: Message, state: FSMContext):
-    if not message.text.isdigit():
-        await message.answer("Нужно просто число, например 3.")
+    text = message.text.strip()
+    if text == "0=0":
+        await db.set_queue(0)
+        await state.clear()
+        await message.answer("Очередь обнулена ✅", reply_markup=MAIN_MENU)
         return
-    n = int(message.text)
-    await db.queue_add(n)
+    try:
+        n = int(text)
+    except ValueError:
+        await message.answer("Нужно число, например 3 или -2.")
+        return
+    new_total = await db.add_queue(n)
     await state.clear()
-    await message.answer(f"Добавлено в очередь на покупку: {n} ✅", reply_markup=MAIN_MENU)
+    await message.answer(f"Теперь в очереди: {new_total} ✅", reply_markup=MAIN_MENU)
+
+
+# ---------- Пауза / запуск рабочего цикла ----------
+
+@dp.message(F.text == "⏸ Пауза")
+async def pause_worker(message: Message):
+    await db.set_enabled(False)
+    await message.answer("Поиск и покупка приостановлены ⏸ (бот сам работает, цикл стоит)", reply_markup=MAIN_MENU)
+
+
+@dp.message(F.text == "▶️ Запустить")
+async def resume_worker(message: Message):
+    await db.set_enabled(True)
+    await message.answer("Поиск и покупка снова работают ▶️", reply_markup=MAIN_MENU)
 
 
 # ---------- Лимит в день ----------
