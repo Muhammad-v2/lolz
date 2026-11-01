@@ -126,12 +126,15 @@ class Worker:
                 sell_price = float(await db.get_setting("sell_price"))
                 title_tpl = await db.get_setting("title_template")
                 title = title_tpl.format(code=country_code or "?", country=country)
-                description = await db.get_setting("sell_description")
+                # "description" — публичное описание (видят все до покупки);
+                # "information" — приватная инфа, видна только покупателю после оплаты.
+                after_purchase_note = await db.get_setting("sell_description")
                 buyer_note = await db.get_setting("sell_buyer_note")
+                information = f"{after_purchase_note}\n{buyer_note}"
 
                 await self.lolz.list_for_sale(
-                    title=title, price=sell_price, description=description,
-                    buyer_note=buyer_note, hex_key=hex_key, dc_id=dc_id,
+                    title=title, price=sell_price, description="",
+                    information=information, hex_key=hex_key, dc_id=dc_id,
                 )
                 await db.update_purchase_status(item_id, "listed")
                 await self.send_log(f"💰 Аккаунт #{item_id} выставлен на продажу за {sell_price}₽: {title}")
