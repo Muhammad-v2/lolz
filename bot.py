@@ -27,7 +27,25 @@ MAIN_MENU = ReplyKeyboardMarkup(
         [KeyboardButton(text="📊 Статус"), KeyboardButton(text="🛒 Купить аккаунты")],
         [KeyboardButton(text="💰 Лимит в день"), KeyboardButton(text="📥 Цена покупки")],
         [KeyboardButton(text="📤 Цена продажи"), KeyboardButton(text="📝 Шаблон заголовка")],
-        [KeyboardButton(text="⏱ Интервал поиска"), KeyboardButton(text="❌ Отмена")],
+        [KeyboardButton(text="⏱ Интервал поиска"), KeyboardButton(text="🎛 Фильтры поиска")],
+        [KeyboardButton(text="❌ Отмена")],
+    ],
+    resize_keyboard=True,
+)
+
+FILTERS_MENU = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="🚫 Спам-блок"), KeyboardButton(text="🔒 Пароль")],
+        [KeyboardButton(text="⏳ Возраст сессии")],
+        [KeyboardButton(text="⬅️ Назад в меню")],
+    ],
+    resize_keyboard=True,
+)
+
+YES_NO_KB = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Да"), KeyboardButton(text="Нет"), KeyboardButton(text="Неважно")],
+        [KeyboardButton(text="❌ Отмена")],
     ],
     resize_keyboard=True,
 )
@@ -47,6 +65,9 @@ class Form(StatesGroup):
     sell_price = State()
     title_template = State()
     interval = State()
+    filter_spam = State()
+    filter_password = State()
+    session_age = State()
 
 
 async def send_log(text: str):
@@ -226,3 +247,101 @@ async def set_interval(message: Message, state: FSMContext):
     await db.set_setting("search_interval_sec", message.text)
     await state.clear()
     await message.answer(f"Интервал поиска: {message.text} сек ✅", reply_markup=MAIN_MENU)
+
+
+# ---------- Фильтры поиска (как на сайте lzt.market) ----------
+
+YES_NO_MAP = {"да": "yes", "нет": "no", "неважно": "nomatter"}
+YES_NO_LABEL = {"yes": "да", "no": "нет", "nomatter": "неважно"}
+
+
+@dp.message(F.text == "🎛 Фильтры поиска")
+async def open_filters(message: Message, state: FSMContext):
+    await state.clear()
+    spam = await db.get_setting("filter_spam")
+    password = await db.get_setting("filter_password")
+    sess_v = await db.get_setting("session_age_value")
+    sess_p = await db.get_setting("session_age_period")
+    await message.answer(
+        "Текущие фильтры поиска:\n"
+        f"🚫 Спам-блок: {YES_NO_LABEL.get(spam, spam)}\n"
+        f"🔒 Пароль: {YES_NO_LABEL.get(password, password)}\n"
+        f"⏳ Возраст сессии: больше {sess_v} {sess_p}\n\n"
+        f"Цена покупки настраивается отдельной кнопкой «📥 Цена покупки».\n\n"
+        f"Выбери, что изменить:",
+        reply_markup=FILTERS_MENU,
+    )
+
+
+@dp.message(F.text == "⬅️ Назад в меню")
+async def back_to_main(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Главное меню:", reply_markup=MAIN_MENU)
+
+
+@dp.message(F.text == "🚫 Спам-блок")
+async def ask_spam(message: Message, state: FSMContext):
+    await state.set_state(Form.filter_spam)
+    await message.answer(
+        "Искать аккаунты со спам-блоком?\n"
+        "«Да» — только со спам-блоком\n«Нет» — только без него\n«Неважно» — любые",
+        reply_markup=YES_NO_KB,
+    )
+
+
+@dp.message(StateFilter(Form.filter_spam))
+async def set_spam(message: Message, state: FSMContext):
+    value = YES_NO_MAP.get(message.text.strip().lower())
+    if not value:
+        await message.answer("Выбери один из вариантов на клавиатуре.")
+        return
+    await db.set_setting("filter_spam", value)
+    await state.clear()
+    await message.answer(f"Спам-блок: {YES_NO_LABEL[value]} ✅", reply_markup=FILTERS_MENU)
+
+
+@dp.message(F.text == "🔒 Пароль")
+async def ask_password(message: Message, state: FSMContext):
+    await state.set_state(Form.filter_password)
+    await message.answer(
+        "Искать аккаунты с облачным паролем?\n"
+        "«Да» — только с паролем\n«Нет» — только без пароля\n«Неважно» — любые",
+        reply_markup=YES_NO_KB,
+    )
+
+
+@dp.message(StateFilter(Form.filter_password))
+async def set_password(message: Message, state: FSMContext):
+    value = YES_NO_MAP.get(message.text.strip().lower())
+    if not value:
+        await message.answer("Выбери один из вариантов на клавиатуре.")
+        return
+    await db.set_setting("filter_password", value)
+    await state.clear()
+    await message.answer(f"Пароль: {YES_NO_LABEL[value]} ✅", reply_markup=FILTERS_MENU)
+
+
+@dp.message(F.text == "⏳ Возраст сессии")
+async def ask_session_age(message: Message, state: FSMContext):
+    sess_v = await db.get_setting("session_age_value")
+    sess_p = await db.get_setting("session_age_period")
+    await state.set_state(Form.session_age)
+    await message.answer(
+        f"Текущее значение: больше {sess_v} {sess_p}\n\n"
+        f"Напиши новое значение в формате: число период\n"
+        f"Период может быть: day (дни), month (месяцы), year (годы)\n"
+        f"Пример: 1 day — сессия старше одного дня (~24 часа)",
+        reply_markup=CANCEL_KB,
+    )
+
+
+@dp.message(StateFilter(Form.session_age))
+async def set_session_age(message: Message, state: FSMContext):
+    parts = message.text.split()
+    if len(parts) != 2 or not parts[0].isdigit() or parts[1] not in ("day", "month", "year"):
+        await message.answer("Формат: число период (day/month/year). Пример: 1 day")
+        return
+    await db.set_setting("session_age_value", parts[0])
+    await db.set_setting("session_age_period", parts[1])
+    await state.clear()
+    await message.answer(f"Возраст сессии: больше {parts[0]} {parts[1]} ✅", reply_markup=FILTERS_MENU)
