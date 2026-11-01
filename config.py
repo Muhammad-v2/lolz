@@ -22,9 +22,12 @@ DEFAULTS = {
     "buy_min_price": 5,
     "buy_max_price": 7,
     "sell_price": 11,
-    "min_session_hours": 24,
     "daily_limit": 30,          # лимит трат в рублях на день
     "search_interval_sec": 60,  # как часто искать новые лоты
+    "filter_spam": "nomatter",      # спам-блок: yes / no / nomatter
+    "filter_password": "no",        # облачный пароль: yes / no / nomatter
+    "session_age_value": 1,         # возраст сессии (число)
+    "session_age_period": "day",    # единица: day / month / year
     "title_template": "+{code} {country} | Чистый | Не трогал",
     "sell_description": "После покупки меняйте почту и 2FA.",
     "sell_buyer_note": "Напишите отзыв.",
