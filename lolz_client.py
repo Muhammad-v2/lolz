@@ -8,7 +8,7 @@ https://docs.api.zelenka.guru/market/ — названия некоторых п
 import httpx
 from config import LOLZ_TOKEN, ALLOWED_ORIGINS, SECRET_WORD
 
-BASE_URL = "https://api.lzt.market"
+BASE_URL = "https://prod-api.lzt.market"
 
 
 class LolzError(Exception):
