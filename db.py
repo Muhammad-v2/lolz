@@ -1,9 +1,8 @@
 """
 Работа с Postgres (Neon). Хранит:
-- settings: текущие настройки бота (цены, лимиты, шаблон)
+- settings: текущие настройки бота (цены, лимиты, шаблон, очередь, вкл/выкл)
 - purchases: купленные аккаунты и их статус в конвейере
 - daily_spend: сколько потрачено за сегодня (для дневного лимита)
-- logs: лог событий для истории (дублирует то, что шлём в Telegram)
 """
 import asyncpg
 import datetime
@@ -42,20 +41,21 @@ async def init_db():
                 spent NUMERIC NOT NULL DEFAULT 0
             );
         """)
-        await con.execute("""
-            CREATE TABLE IF NOT EXISTS buy_queue (
-                id SERIAL PRIMARY KEY,
-                remaining INT NOT NULL,
-                created_at TIMESTAMPTZ DEFAULT now()
-            );
-        """)
-        # дефолтные настройки, если их ещё нет
         for k, v in DEFAULTS.items():
             await con.execute(
                 "INSERT INTO settings (key, value) VALUES ($1, $2) "
                 "ON CONFLICT (key) DO NOTHING",
                 k, str(v)
             )
+        # очередь и переключатель работы — тоже просто настройки
+        await con.execute(
+            "INSERT INTO settings (key, value) VALUES ('queue_remaining', '0') "
+            "ON CONFLICT (key) DO NOTHING"
+        )
+        await con.execute(
+            "INSERT INTO settings (key, value) VALUES ('worker_enabled', '1') "
+            "ON CONFLICT (key) DO NOTHING"
+        )
 
 
 async def get_setting(key: str) -> str:
@@ -95,33 +95,66 @@ async def add_spent(amount: float):
         """, today, amount)
 
 
-async def queue_add(count: int):
-    async with _pool.acquire() as con:
-        await con.execute("INSERT INTO buy_queue (remaining) VALUES ($1)", count)
+# ---------- Очередь на покупку (одно число, можно прибавлять/убавлять) ----------
+
+async def get_queue() -> int:
+    val = await get_setting("queue_remaining")
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return 0
 
 
-async def queue_remaining() -> int:
-    async with _pool.acquire() as con:
-        row = await con.fetchrow("SELECT COALESCE(SUM(remaining),0) AS total FROM buy_queue")
-        return int(row["total"])
-
-
-async def queue_consume_one():
-    """Списывает одну единицу из самой старой незакрытой записи очереди."""
+async def add_queue(delta: int):
+    """delta может быть отрицательным — убавляет очередь, но не ниже 0."""
     async with _pool.acquire() as con:
         async with con.transaction():
             row = await con.fetchrow(
-                "SELECT id, remaining FROM buy_queue WHERE remaining > 0 "
-                "ORDER BY created_at LIMIT 1 FOR UPDATE"
+                "SELECT value FROM settings WHERE key='queue_remaining' FOR UPDATE"
             )
-            if not row:
+            current = int(row["value"]) if row else 0
+            new_val = max(0, current + delta)
+            await con.execute(
+                "INSERT INTO settings (key, value) VALUES ('queue_remaining', $1) "
+                "ON CONFLICT (key) DO UPDATE SET value=$1",
+                str(new_val)
+            )
+    return new_val
+
+
+async def set_queue(value: int):
+    value = max(0, value)
+    await set_setting("queue_remaining", value)
+
+
+async def queue_consume_one() -> bool:
+    async with _pool.acquire() as con:
+        async with con.transaction():
+            row = await con.fetchrow(
+                "SELECT value FROM settings WHERE key='queue_remaining' FOR UPDATE"
+            )
+            current = int(row["value"]) if row else 0
+            if current <= 0:
                 return False
             await con.execute(
-                "UPDATE buy_queue SET remaining = remaining - 1 WHERE id=$1",
-                row["id"]
+                "UPDATE settings SET value=$1 WHERE key='queue_remaining'",
+                str(current - 1)
             )
             return True
 
+
+# ---------- Вкл/выкл рабочего цикла поиска ----------
+
+async def is_enabled() -> bool:
+    val = await get_setting("worker_enabled")
+    return val == "1"
+
+
+async def set_enabled(enabled: bool):
+    await set_setting("worker_enabled", "1" if enabled else "0")
+
+
+# ---------- Покупки ----------
 
 async def add_purchase(item_id: int, price: float, phone: str, country: str, country_code: str):
     async with _pool.acquire() as con:
