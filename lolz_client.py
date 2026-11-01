@@ -1,17 +1,26 @@
 """
-Обёртка над Lolz (lzt.market) Market API через httpx.
+Обёртка над Lolz Market API.
 
-Сверено с официальной документацией:
-https://lzt-market.readme.io/reference/information
+Использует стороннюю типизированную библиотеку lztmarket (пакет на PyPI
+"lztmarket", модуль "lztmarketapi"), которая сверена с официальной
+OpenAPI-схемой Market API — то есть названия полей в ответах берутся
+из реальной схемы API, а не угадываются вручную.
 
-Места, которые всё ещё стоит проверить на реальных данных (TODO),
-касаются только структуры ответа API при покупке/продаже — сами
-параметры запросов уже сверены с документацией.
+Если какого-то метода в библиотеке ещё нет (новый/редкий эндпоинт),
+используется типизированный "escape hatch" market.general.request(...).
 """
-import httpx
+import logging
+from decimal import Decimal
+
+from lztmarketapi import (
+    AsyncLZTMarket, CategoryName, SearchParams, OrderBy,
+    AddItemRequest, CategoryID, Currency, ItemOrigin,
+    APIError, RateLimitError,
+)
+
 from config import LOLZ_TOKEN, ALLOWED_ORIGINS
 
-BASE_URL = "https://api.lzt.market"
+log = logging.getLogger("lolz_client")
 
 
 class LolzError(Exception):
@@ -20,82 +29,91 @@ class LolzError(Exception):
 
 class LolzClient:
     def __init__(self, token: str = LOLZ_TOKEN):
-        self._headers = {"Authorization": f"Bearer {token}"}
-        self._client = httpx.AsyncClient(base_url=BASE_URL, headers=self._headers, timeout=300)
+        self._market = AsyncLZTMarket(token, locale="ru-RU")
 
     async def close(self):
-        await self._client.aclose()
+        await self._market.aclose()
 
     async def search_telegram_accounts(self, price_min: float, price_max: float,
                                         spam: str = "nomatter", password: str = "no",
                                         session_age_value: int = 1, session_age_period: str = "day"):
-        """
-        Ищет лоты Telegram-аккаунтов по цене, разрешённым категориям
-        происхождения и остальным фильтрам (спам-блок, пароль, возраст сессии) —
-        как на сайте lzt.market.
-        """
-        params = {
-            "pmin": price_min,
-            "pmax": price_max,
+        params = SearchParams.model_validate({
+            "pmin": str(price_min),
+            "pmax": str(price_max),
+            "order_by": OrderBy.PRICE_ASC,
             "origin[]": ALLOWED_ORIGINS,
-            "order_by": "price_to_up",
             "spam": spam,
             "password": password,
             "session_age": session_age_value,
             "session_age_period": session_age_period,
-        }
-        resp = await self._client.get("/telegram", params=params)
-        if resp.status_code != 200:
-            raise LolzError(f"Поиск не удался ({resp.status_code}): {resp.text}")
-        data = resp.json()
-        return data.get("items", [])
+        })
+        try:
+            response = await self._market.categories.search(CategoryName.TELEGRAM, params)
+        except (APIError, RateLimitError) as e:
+            raise LolzError(f"Поиск не удался: {e}") from e
+
+        # response.items — список pydantic-моделей; превращаем в простые словари,
+        # чтобы остальной код (worker.py) мог работать с ними как раньше.
+        return [item.model_dump() for item in response.items]
 
     async def buy_item(self, item_id: int, price: float):
-        """Быстрая покупка лота по фиксированной цене (эндпоинт /{item_id}/fast-buy)."""
-        payload = {"price": price}
-        resp = await self._client.post(f"/{item_id}/fast-buy", data=payload)
-        if resp.status_code != 200:
-            raise LolzError(f"Покупка не удалась ({resp.status_code}): {resp.text}")
-        return resp.json()
+        """Быстрая покупка лота (через escape hatch — метод fast-buy)."""
+        try:
+            result = await self._market.general.request(
+                "POST", f"/{item_id}/fast-buy", dict,
+                data={"price": str(price)},
+            )
+        except (APIError, RateLimitError) as e:
+            raise LolzError(f"Покупка не удалась: {e}") from e
+        return result
 
     async def get_item_login_data(self, item_id: int):
-        """Возвращает данные для входа в купленный аккаунт."""
-        resp = await self._client.get(f"/{item_id}")
-        if resp.status_code != 200:
-            raise LolzError(f"Не удалось получить данные лота ({resp.status_code}): {resp.text}")
-        return resp.json()
+        """
+        Возвращает ПОЛНЫЕ данные по купленному лоту, включая всё, что вернула
+        pydantic-модель (включая нестандартные/новые поля — через model_extra),
+        чтобы не терять данные для входа, даже если их имя нам неизвестно заранее.
+        """
+        try:
+            response = await self._market.items.get(item_id)
+        except (APIError, RateLimitError) as e:
+            raise LolzError(f"Не удалось получить данные лота: {e}") from e
+
+        data = response.item.model_dump()
+        # добавляем "сырые" дополнительные поля, если pydantic их не распознал
+        extra = getattr(response.item, "model_extra", None)
+        if extra:
+            data.update(extra)
+        return data
 
     async def list_for_sale(self, title: str, price: float, description: str,
                              information: str, hex_key: str, dc_id: int):
-        """
-        Выставляет новый товар (Telegram-аккаунт) на продажу через
-        эндпоинт /item/fast-sell. category_id=24 — это Telegram
-        (список категорий из документации).
+        req = AddItemRequest(
+            title=title,
+            price=Decimal(str(price)),
+            category_id=CategoryID.TELEGRAM,
+            currency=Currency.RUB,
+            item_origin=ItemOrigin.RESALE,
+            description=description,
+            information=information,
+        )
+        # Поля для HEX/DC специфичны для категории Telegram — pydantic
+        # в lztmarket пропускает неизвестные ему доп. поля через model_extra,
+        # поэтому передаём их через словарь перед отправкой.
+        payload = req.model_dump(exclude_none=True)
+        payload["extra[auth_key]"] = hex_key
+        payload["extra[dc_id]"] = dc_id
 
-        TODO: поле extra для передачи HEX/DC не описано в общей
-        схеме (видимо, зависит от категории) — нужно свериться по
-        реальному ответу от /item/fast-sell либо по разделу
-        "Check Account Details" для категории Telegram.
-        """
-        payload = {
-            "title": title,
-            "price": price,
-            "category_id": 24,  # Telegram
-            "currency": "rub",
-            "item_origin": "resale",
-            "description": description,
-            "information": information,
-            "extra[auth_key]": hex_key,
-            "extra[dc_id]": dc_id,
-        }
-        resp = await self._client.post("/item/fast-sell", data=payload)
-        if resp.status_code != 200:
-            raise LolzError(f"Не удалось выставить лот ({resp.status_code}): {resp.text}")
-        return resp.json()
+        try:
+            result = await self._market.general.request(
+                "POST", "/item/fast-sell", dict, data=payload,
+            )
+        except (APIError, RateLimitError) as e:
+            raise LolzError(f"Не удалось выставить лот: {e}") from e
+        return result
 
     async def get_balance(self) -> float:
-        resp = await self._client.get("/me")
-        if resp.status_code != 200:
-            raise LolzError(f"Не удалось получить баланс ({resp.status_code}): {resp.text}")
-        data = resp.json()
-        return float(data.get("user", {}).get("balance", 0))
+        try:
+            response = await self._market.profile.get()
+        except (APIError, RateLimitError) as e:
+            raise LolzError(f"Не удалось получить баланс: {e}") from e
+        return float(response.user.balance)
