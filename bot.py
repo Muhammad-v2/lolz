@@ -17,6 +17,7 @@ log = logging.getLogger("bot")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
+dp.message.filter(F.from_user.id == ADMIN_ID)
 
 
 # ---------- Клавиатура ----------
@@ -48,14 +49,6 @@ class Form(StatesGroup):
     interval = State()
 
 
-def admin_only(handler):
-    async def wrapper(message: Message, *args, **kwargs):
-        if message.from_user.id != ADMIN_ID:
-            return
-        return await handler(message, *args, **kwargs)
-    return wrapper
-
-
 async def send_log(text: str):
     try:
         await bot.send_message(ADMIN_ID, text)
@@ -66,7 +59,6 @@ async def send_log(text: str):
 # ---------- Старт / отмена ----------
 
 @dp.message(Command("start", "help"))
-@admin_only
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(
@@ -76,7 +68,6 @@ async def cmd_start(message: Message, state: FSMContext):
 
 
 @dp.message(F.text == "❌ Отмена")
-@admin_only
 async def cmd_cancel(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("Отменено.", reply_markup=MAIN_MENU)
@@ -85,7 +76,6 @@ async def cmd_cancel(message: Message, state: FSMContext):
 # ---------- Статус ----------
 
 @dp.message(F.text == "📊 Статус")
-@admin_only
 async def show_status(message: Message):
     settings = await db.get_settings()
     spent = await db.get_today_spent()
@@ -112,14 +102,12 @@ async def show_status(message: Message):
 # ---------- Купить аккаунты ----------
 
 @dp.message(F.text == "🛒 Купить аккаунты")
-@admin_only
 async def ask_buy_count(message: Message, state: FSMContext):
     await state.set_state(Form.buy_count)
     await message.answer("Сколько аккаунтов купить? Напиши число.", reply_markup=CANCEL_KB)
 
 
 @dp.message(StateFilter(Form.buy_count))
-@admin_only
 async def set_buy_count(message: Message, state: FSMContext):
     if not message.text.isdigit():
         await message.answer("Нужно просто число, например 3.")
@@ -133,7 +121,6 @@ async def set_buy_count(message: Message, state: FSMContext):
 # ---------- Лимит в день ----------
 
 @dp.message(F.text == "💰 Лимит в день")
-@admin_only
 async def ask_daily_limit(message: Message, state: FSMContext):
     current = await db.get_setting("daily_limit")
     await state.set_state(Form.daily_limit)
@@ -144,7 +131,6 @@ async def ask_daily_limit(message: Message, state: FSMContext):
 
 
 @dp.message(StateFilter(Form.daily_limit))
-@admin_only
 async def set_daily_limit(message: Message, state: FSMContext):
     if not message.text.replace(".", "", 1).isdigit():
         await message.answer("Нужно число, например 30.")
@@ -157,7 +143,6 @@ async def set_daily_limit(message: Message, state: FSMContext):
 # ---------- Цена покупки ----------
 
 @dp.message(F.text == "📥 Цена покупки")
-@admin_only
 async def ask_buy_price(message: Message, state: FSMContext):
     mn = await db.get_setting("buy_min_price")
     mx = await db.get_setting("buy_max_price")
@@ -170,7 +155,6 @@ async def ask_buy_price(message: Message, state: FSMContext):
 
 
 @dp.message(StateFilter(Form.buy_price))
-@admin_only
 async def set_buy_price(message: Message, state: FSMContext):
     parts = message.text.split()
     if len(parts) != 2 or not all(p.isdigit() for p in parts):
@@ -185,7 +169,6 @@ async def set_buy_price(message: Message, state: FSMContext):
 # ---------- Цена продажи ----------
 
 @dp.message(F.text == "📤 Цена продажи")
-@admin_only
 async def ask_sell_price(message: Message, state: FSMContext):
     current = await db.get_setting("sell_price")
     await state.set_state(Form.sell_price)
@@ -193,7 +176,6 @@ async def ask_sell_price(message: Message, state: FSMContext):
 
 
 @dp.message(StateFilter(Form.sell_price))
-@admin_only
 async def set_sell_price(message: Message, state: FSMContext):
     if not message.text.isdigit():
         await message.answer("Нужно число, например 11.")
@@ -206,7 +188,6 @@ async def set_sell_price(message: Message, state: FSMContext):
 # ---------- Шаблон заголовка ----------
 
 @dp.message(F.text == "📝 Шаблон заголовка")
-@admin_only
 async def ask_title(message: Message, state: FSMContext):
     current = await db.get_setting("title_template")
     await state.set_state(Form.title_template)
@@ -219,7 +200,6 @@ async def ask_title(message: Message, state: FSMContext):
 
 
 @dp.message(StateFilter(Form.title_template))
-@admin_only
 async def set_title(message: Message, state: FSMContext):
     await db.set_setting("title_template", message.text)
     await state.clear()
@@ -229,7 +209,6 @@ async def set_title(message: Message, state: FSMContext):
 # ---------- Интервал поиска ----------
 
 @dp.message(F.text == "⏱ Интервал поиска")
-@admin_only
 async def ask_interval(message: Message, state: FSMContext):
     current = await db.get_setting("search_interval_sec")
     await state.set_state(Form.interval)
@@ -240,7 +219,6 @@ async def ask_interval(message: Message, state: FSMContext):
 
 
 @dp.message(StateFilter(Form.interval))
-@admin_only
 async def set_interval(message: Message, state: FSMContext):
     if not message.text.isdigit():
         await message.answer("Нужно число секунд, например 60.")
