@@ -51,14 +51,20 @@ class Worker:
 
         price_min = float(await db.get_setting("buy_min_price"))
         price_max = float(await db.get_setting("buy_max_price"))
-        min_hours = int(await db.get_setting("min_session_hours"))
+        spam = await db.get_setting("filter_spam")
+        password = await db.get_setting("filter_password")
+        session_age_value = int(await db.get_setting("session_age_value"))
+        session_age_period = await db.get_setting("session_age_period")
 
         max_affordable = daily_limit - spent_today
         price_max = min(price_max, max_affordable)
         if price_max < price_min:
             return
 
-        items = await self.lolz.search_telegram_accounts(price_min, price_max, min_hours)
+        items = await self.lolz.search_telegram_accounts(
+            price_min, price_max, spam=spam, password=password,
+            session_age_value=session_age_value, session_age_period=session_age_period,
+        )
         if not items:
             return
 
