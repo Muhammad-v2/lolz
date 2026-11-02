@@ -61,7 +61,7 @@ class LolzClient:
         try:
             result = await self._market.general.request(
                 "POST", f"/{item_id}/fast-buy", dict,
-                data={"price": str(price)},
+                json={"price": str(price)},
             )
         except (APIError, RateLimitError) as e:
             raise LolzError(f"Покупка не удалась: {e}") from e
@@ -105,7 +105,7 @@ class LolzClient:
 
         try:
             result = await self._market.general.request(
-                "POST", "/item/fast-sell", dict, data=payload,
+                "POST", "/item/fast-sell", dict, json=payload,
             )
         except (APIError, RateLimitError) as e:
             raise LolzError(f"Не удалось выставить лот: {e}") from e
