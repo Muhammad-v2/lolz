@@ -3,6 +3,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from lztmarketapi import (
@@ -23,6 +24,107 @@ log = logging.getLogger("lolz_client")
 
 class LolzError(Exception):
     pass
+
+
+# ISO → (русское название, телефонный код без +)
+COUNTRY_INFO = {
+    "RU": ("Россия", "7"),
+    "UA": ("Украина", "380"),
+    "BY": ("Беларусь", "375"),
+    "KZ": ("Казахстан", "7"),
+    "UZ": ("Узбекистан", "998"),
+    "KG": ("Кыргызстан", "996"),
+    "TJ": ("Таджикистан", "992"),
+    "AM": ("Армения", "374"),
+    "AZ": ("Азербайджан", "994"),
+    "GE": ("Грузия", "995"),
+    "MD": ("Молдова", "373"),
+    "IN": ("Индия", "91"),
+    "ID": ("Индонезия", "62"),
+    "PH": ("Филиппины", "63"),
+    "VN": ("Вьетнам", "84"),
+    "TH": ("Таиланд", "66"),
+    "MY": ("Малайзия", "60"),
+    "BD": ("Бангладеш", "880"),
+    "PK": ("Пакистан", "92"),
+    "NP": ("Непал", "977"),
+    "LK": ("Шри-Ланка", "94"),
+    "CN": ("Китай", "86"),
+    "HK": ("Гонконг", "852"),
+    "TW": ("Тайвань", "886"),
+    "JP": ("Япония", "81"),
+    "KR": ("Южная Корея", "82"),
+    "US": ("США", "1"),
+    "CA": ("Канада", "1"),
+    "GB": ("Великобритания", "44"),
+    "UK": ("Великобритания", "44"),
+    "DE": ("Германия", "49"),
+    "FR": ("Франция", "33"),
+    "IT": ("Италия", "39"),
+    "ES": ("Испания", "34"),
+    "PL": ("Польша", "48"),
+    "RO": ("Румыния", "40"),
+    "CZ": ("Чехия", "420"),
+    "NL": ("Нидерланды", "31"),
+    "BE": ("Бельгия", "32"),
+    "TR": ("Турция", "90"),
+    "EG": ("Египет", "20"),
+    "NG": ("Нигерия", "234"),
+    "ZA": ("ЮАР", "27"),
+    "BR": ("Бразилия", "55"),
+    "AR": ("Аргентина", "54"),
+    "MX": ("Мексика", "52"),
+    "CO": ("Колумбия", "57"),
+    "PE": ("Перу", "51"),
+    "CL": ("Чили", "56"),
+    "AE": ("ОАЭ", "971"),
+    "SA": ("Саудовская Аравия", "966"),
+    "IL": ("Израиль", "972"),
+    "IQ": ("Ирак", "964"),
+    "IR": ("Иран", "98"),
+    "AF": ("Афганистан", "93"),
+    "AU": ("Австралия", "61"),
+    "NZ": ("Новая Зеландия", "64"),
+}
+
+PHONE_PREFIXES = sorted(
+    [
+        ("998", "UZ"), ("996", "KG"), ("995", "GE"), ("994", "AZ"),
+        ("992", "TJ"), ("977", "NP"), ("971", "AE"), ("966", "SA"),
+        ("972", "IL"), ("964", "IQ"), ("880", "BD"), ("852", "HK"),
+        ("886", "TW"), ("380", "UA"), ("375", "BY"), ("374", "AM"),
+        ("373", "MD"), ("420", "CZ"), ("234", "NG"),
+        ("98", "IR"), ("93", "AF"), ("92", "PK"), ("91", "IN"),
+        ("90", "TR"), ("86", "CN"), ("84", "VN"), ("82", "KR"),
+        ("81", "JP"), ("66", "TH"), ("63", "PH"), ("62", "ID"),
+        ("61", "AU"), ("60", "MY"), ("55", "BR"), ("54", "AR"),
+        ("52", "MX"), ("51", "PE"), ("49", "DE"), ("48", "PL"),
+        ("44", "GB"), ("40", "RO"), ("39", "IT"), ("34", "ES"),
+        ("33", "FR"), ("32", "BE"), ("31", "NL"), ("27", "ZA"),
+        ("20", "EG"), ("7", "RU"), ("1", "US"),
+    ],
+    key=lambda x: -len(x[0]),
+)
+
+NAME_TO_ISO = {
+    "india": "IN", "индия": "IN",
+    "russia": "RU", "россия": "RU", "рф": "RU",
+    "ukraine": "UA", "украина": "UA",
+    "indonesia": "ID", "индонезия": "ID",
+    "usa": "US", "united states": "US", "сша": "US",
+    "kazakhstan": "KZ", "казахстан": "KZ",
+    "uzbekistan": "UZ", "узбекистан": "UZ",
+    "bangladesh": "BD", "бангладеш": "BD",
+    "pakistan": "PK", "пакистан": "PK",
+    "philippines": "PH", "филиппины": "PH",
+    "vietnam": "VN", "вьетнам": "VN",
+    "china": "CN", "китай": "CN",
+    "turkey": "TR", "турция": "TR",
+    "brazil": "BR", "бразилия": "BR",
+    "germany": "DE", "германия": "DE",
+    "france": "FR", "франция": "FR",
+    "uk": "GB", "united kingdom": "GB", "великобритания": "GB",
+}
 
 
 class LolzClient:
@@ -59,24 +161,55 @@ class LolzClient:
         return [item.model_dump() for item in response.items]
 
     async def buy_item(self, item_id: int, price: float):
-        body: dict = {"price": str(price)}
+        """
+        Fast-buy. При 403 с retry_request — повторяем (так требует API Lolz).
+        price должен совпадать с текущей ценой лота.
+        """
+        body: dict = {"price": float(price)}
         if SECRET_WORD:
             body["secret_answer"] = SECRET_WORD
 
-        try:
-            result = await self._market.general.request(
-                "POST",
-                f"/{item_id}/fast-buy",
-                StatusResponse,
-                json=body,
-            )
-        except (APIError, RateLimitError) as e:
-            raise LolzError(f"Покупка не удалась: {e}") from e
-        data = result.model_dump()
-        extra = getattr(result, "model_extra", None)
-        if extra:
-            data.update(extra)
-        return data
+        last_err = None
+        for attempt in range(1, 31):
+            try:
+                result = await self._market.general.request(
+                    "POST",
+                    f"/{item_id}/fast-buy",
+                    StatusResponse,
+                    json=body,
+                )
+                data = result.model_dump()
+                extra = getattr(result, "model_extra", None)
+                if extra:
+                    data.update(extra)
+                return data
+            except (APIError, RateLimitError) as e:
+                last_err = e
+                text = str(e).lower()
+                raw = ""
+                for attr in ("response", "body", "payload", "data"):
+                    val = getattr(e, attr, None)
+                    if val is not None:
+                        raw = str(val)
+                        break
+                combined = f"{text} {raw}".lower()
+
+                if "retry_request" in combined or "retry request" in combined:
+                    await asyncio.sleep(min(1.5 + attempt * 0.3, 8))
+                    continue
+
+                if any(x in combined for x in (
+                    "sold", "продан", "deleted", "удалён", "удален", "not available"
+                )):
+                    raise LolzError(f"Лот уже недоступен: {e}") from e
+
+                if "403" in combined and attempt < 10:
+                    await asyncio.sleep(min(1.0 + attempt * 0.4, 6))
+                    continue
+
+                raise LolzError(f"Покупка не удалась: {e}") from e
+
+        raise LolzError(f"Покупка не удалась после ретраев: {last_err}")
 
     async def get_item_login_data(self, item_id: int) -> dict:
         try:
@@ -158,6 +291,10 @@ class LolzClient:
 
     @staticmethod
     def extract_phone_country(data: dict) -> tuple[str | None, str, str]:
+        """
+        Возвращает (phone, country_ru, code_with_plus)
+        Пример: ("9198...", "Индия", "+91")
+        """
         phone = None
         for key in ("telegram_phone", "telegramPhone", "phone", "login_phone"):
             val = data.get(key)
@@ -165,37 +302,66 @@ class LolzClient:
                 phone = str(val).strip()
                 break
 
-        country = None
-        for key in ("telegram_country", "telegramCountry", "country", "country_name"):
+        raw_country = None
+        for key in (
+            "telegram_country",
+            "telegramCountry",
+            "country",
+            "country_name",
+            "countryCode",
+            "country_code",
+        ):
             val = data.get(key)
             if val is not None and str(val).strip():
-                country = str(val).strip()
+                raw_country = str(val).strip()
                 break
-        country = country or "—"
 
-        country_code = ""
-        if phone:
-            parts = phone.replace("(", " ").replace(")", " ").split()
-            if parts and parts[0].startswith("+"):
-                country_code = parts[0]
+        iso = None
+        if raw_country:
+            up = raw_country.upper().strip()
+            if len(up) == 2 and up.isalpha():
+                iso = up
             else:
-                digits = "".join(ch for ch in phone if ch.isdigit())
-                if digits.startswith("7") and len(digits) >= 11:
-                    country_code = "+7"
-                elif digits.startswith("380"):
-                    country_code = "+380"
-                elif digits.startswith("1") and len(digits) >= 11:
-                    country_code = "+1"
+                iso = NAME_TO_ISO.get(raw_country.lower().strip())
 
-        for key in ("phone_code", "phoneCode", "country_code", "countryCode"):
+        digits = ""
+        if phone:
+            digits = "".join(ch for ch in phone if ch.isdigit())
+
+        if not iso and digits:
+            for prefix, code in PHONE_PREFIXES:
+                if digits.startswith(prefix):
+                    iso = code
+                    break
+
+        country_ru = "—"
+        phone_code = ""
+
+        if iso and iso in COUNTRY_INFO:
+            country_ru, phone_code = COUNTRY_INFO[iso]
+        elif raw_country and len(raw_country) > 2:
+            country_ru = raw_country
+        elif iso:
+            country_ru = iso
+
+        if not phone_code and digits:
+            for prefix, code in PHONE_PREFIXES:
+                if digits.startswith(prefix):
+                    phone_code = prefix
+                    if country_ru == "—" and code in COUNTRY_INFO:
+                        country_ru, _ = COUNTRY_INFO[code]
+                    break
+
+        for key in ("phone_code", "phoneCode"):
             val = data.get(key)
             if val is not None and str(val).strip():
-                country_code = str(val).strip()
-                if not country_code.startswith("+") and country_code.isdigit():
-                    country_code = "+" + country_code
+                pc = "".join(ch for ch in str(val) if ch.isdigit())
+                if pc:
+                    phone_code = pc
                 break
 
-        return phone, country, country_code
+        country_code = f"+{phone_code}" if phone_code else ""
+        return phone, country_ru, country_code
 
     async def list_for_sale(
         self,
