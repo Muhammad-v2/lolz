@@ -15,7 +15,7 @@ from decimal import Decimal
 from lztmarketapi import (
     AsyncLZTMarket, CategoryName, SearchParams, OrderBy,
     AddItemRequest, CategoryID, Currency, ItemOrigin,
-    APIError, RateLimitError,
+    APIError, RateLimitError, StatusResponse,
 )
 
 from config import LOLZ_TOKEN, ALLOWED_ORIGINS
@@ -60,12 +60,16 @@ class LolzClient:
         """Быстрая покупка лота (через escape hatch — метод fast-buy)."""
         try:
             result = await self._market.general.request(
-                "POST", f"/{item_id}/fast-buy", dict,
+                "POST", f"/{item_id}/fast-buy", StatusResponse,
                 json={"price": str(price)},
             )
         except (APIError, RateLimitError) as e:
             raise LolzError(f"Покупка не удалась: {e}") from e
-        return result
+        data = result.model_dump()
+        extra = getattr(result, "model_extra", None)
+        if extra:
+            data.update(extra)
+        return data
 
     async def get_item_login_data(self, item_id: int):
         """
@@ -105,11 +109,11 @@ class LolzClient:
 
         try:
             result = await self._market.general.request(
-                "POST", "/item/fast-sell", dict, json=payload,
+                "POST", "/item/fast-sell", StatusResponse, json=payload,
             )
         except (APIError, RateLimitError) as e:
             raise LolzError(f"Не удалось выставить лот: {e}") from e
-        return result
+        return result.model_dump()
 
     async def get_balance(self) -> float:
         try:
