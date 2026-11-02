@@ -92,7 +92,7 @@ class Worker:
         except LolzError as e:
             msg = str(e)
             low = msg.lower()
-            if "продан" in low or "sold" in low or "already" in low:
+            if "продан" in low or "sold" in low or "already" in low or "недоступен" in low:
                 await self.send_log(f"ℹ️ Лот #{item_id} уже купили раньше нас, пробую другой")
                 return
             log.exception("Ошибка обработки лота %s", item_id)
@@ -130,7 +130,8 @@ class Worker:
         await db.add_purchase(item_id, price, phone or "", country, country_code)
         await self.send_log(
             f"✅ Куплен аккаунт #{item_id}\n"
-            f"Телефон: {phone}\nСтрана: {country}\nЦена: {price}₽\n"
+            f"Телефон: {phone}\nСтрана: {country}\nКод: {country_code or '—'}\n"
+            f"Цена: {price}₽\n"
             f"User ID: {data.get('telegram_id') or data.get('telegramId') or '—'}\n"
             f"HEX: {'есть' if hex_key_bought else 'нет'}, DC: {dc_id_bought or 'нет'}"
         )
@@ -179,9 +180,12 @@ class Worker:
             sell_price = float(await db.get_setting("sell_price"))
             title_tpl = await db.get_setting("title_template")
             try:
-                title = title_tpl.format(code=country_code or "?", country=country)
+                title = title_tpl.format(
+                    code=country_code or "?",
+                    country=country or "—",
+                )
             except Exception:
-                title = f"+{country_code or '?'} {country} | Чистый"
+                title = f"{country_code or '?'} {country or '—'} | Чистый | Не трогал"
 
             after_purchase_note = await db.get_setting("sell_description")
             buyer_note = await db.get_setting("sell_buyer_note")
