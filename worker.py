@@ -1,15 +1,20 @@
 """
-Фоновый цикл: раз в N секунд проверяет очередь покупок, ищет подходящие
-лоты, покупает и прогоняет аккаунт через весь конвейер до выставления
-на продажу. Все шаги и ошибки отправляются админу через send_log().
+Фоновый цикл: поиск → покупка → перелогин → чистка → продажа.
 """
+from __future__ import annotations
+
 import asyncio
 import logging
+
 from lolz_client import LolzClient, LolzError
 from telethon_actions import (
-    connect_from_hex_dc, terminate_other_sessions,
-    create_new_session, get_auth_hex_and_dc, terminate_this_session,
-    cleanup_account, AccountPipelineError,
+    connect_from_hex_dc,
+    terminate_other_sessions,
+    create_new_session,
+    get_auth_hex_and_dc,
+    terminate_this_session,
+    cleanup_account,
+    AccountPipelineError,
 )
 import db
 
@@ -18,7 +23,7 @@ log = logging.getLogger("worker")
 
 class Worker:
     def __init__(self, send_log):
-        self.send_log = send_log  # async fn(text) -> отправка сообщения админу
+        self.send_log = send_log
         self.lolz = LolzClient()
         self._running = False
 
@@ -35,18 +40,21 @@ class Worker:
             except Exception as e:
                 log.exception("Ошибка в рабочем цикле")
                 await self.send_log(f"⚠️ Ошибка в рабочем цикле: {e}")
-            interval = int(await db.get_setting("search_interval_sec"))
-            await asyncio.sleep(interval)
+            try:
+                interval = int(await db.get_setting("search_interval_sec"))
+            except Exception:
+                interval = 60
+            await asyncio.sleep(max(15, interval))
 
     async def _tick(self):
         remaining = await db.get_queue()
         if remaining <= 0:
-            return  # в очереди пусто — нечего искать, молчим
+            return
 
         daily_limit = float(await db.get_setting("daily_limit"))
         spent_today = await db.get_today_spent()
         if spent_today >= daily_limit:
-            return  # лимит на сегодня исчерпан — ждём, пока админ его повысит
+            return
 
         price_min = float(await db.get_setting("buy_min_price"))
         price_max = float(await db.get_setting("buy_max_price"))
@@ -61,54 +69,70 @@ class Worker:
             return
 
         items = await self.lolz.search_telegram_accounts(
-            price_min, price_max, spam=spam, password=password,
-            session_age_value=session_age_value, session_age_period=session_age_period,
+            price_min,
+            price_max,
+            spam=spam,
+            password=password,
+            session_age_value=session_age_value,
+            session_age_period=session_age_period,
         )
         if not items:
             return
 
         item = items[0]
-        item_id = item["item_id"]
-        price = float(item.get("price", price_max))
-
-        ok = await db.queue_consume_one()
-        if not ok:
+        item_id = item.get("item_id") or item.get("itemId") or item.get("id")
+        if item_id is None:
+            await self.send_log(f"⚠️ Странный лот без id: {str(item)[:500]}")
             return
+        item_id = int(item_id)
+        price = float(item.get("price", price_max))
 
         try:
             await self._buy_and_process(item_id, price, item)
         except LolzError as e:
             msg = str(e)
-            if "продан" in msg.lower() or "sold" in msg.lower():
-                await db.add_queue(1)  # вернуть попытку в очередь, лот купили раньше нас
+            low = msg.lower()
+            if "продан" in low or "sold" in low or "already" in low:
                 await self.send_log(f"ℹ️ Лот #{item_id} уже купили раньше нас, пробую другой")
                 return
             log.exception("Ошибка обработки лота %s", item_id)
-            await db.update_purchase_status(item_id, "error", msg)
+            try:
+                await db.update_purchase_status(item_id, "error", msg)
+            except Exception:
+                pass
             await self.send_log(f"❌ Ошибка обработки аккаунта #{item_id}: {msg}")
         except Exception as e:
             log.exception("Ошибка обработки лота %s", item_id)
-            await db.update_purchase_status(item_id, "error", str(e))
+            try:
+                await db.update_purchase_status(item_id, "error", str(e))
+            except Exception:
+                pass
             await self.send_log(f"❌ Ошибка обработки аккаунта #{item_id}: {e}")
 
     async def _buy_and_process(self, item_id: int, price: float, item: dict):
         await self.send_log(f"🛒 Покупаю лот #{item_id} за {price}₽...")
         await self.lolz.buy_item(item_id, price)
+        await db.queue_consume_one()
         await db.add_spent(price)
 
         data = await self.lolz.get_item_login_data(item_id)
 
-        hex_key_bought = data.get("login")
-        dc_id_bought = data.get("telegram_dc_id")
-        phone = data.get("telegram_phone")
-        country = data.get("telegram_country") or "—"
-        country_code = (data.get("phone") or "").split()[0] if data.get("phone") else ""
+        hex_key_bought, dc_id_bought = LolzClient.extract_hex_dc(data)
+        phone, country, country_code = LolzClient.extract_phone_country(data)
 
-        await db.add_purchase(item_id, price, phone, country, country_code)
+        cloud_password = None
+        for key in ("telegram_password", "cloud_password", "password_2fa", "tfa_password"):
+            val = data.get(key)
+            if val and str(val).strip() and not str(val).strip().isdigit():
+                cloud_password = str(val).strip()
+                break
+
+        await db.add_purchase(item_id, price, phone or "", country, country_code)
         await self.send_log(
             f"✅ Куплен аккаунт #{item_id}\n"
             f"Телефон: {phone}\nСтрана: {country}\nЦена: {price}₽\n"
-            f"User ID: {data.get('telegram_id', '—')}"
+            f"User ID: {data.get('telegram_id') or data.get('telegramId') or '—'}\n"
+            f"HEX: {'есть' if hex_key_bought else 'нет'}, DC: {dc_id_bought or 'нет'}"
         )
 
         if not hex_key_bought or not dc_id_bought:
@@ -117,46 +141,73 @@ class Worker:
             await self.send_log(
                 f"❌ #{item_id}: не получены HEX/DC, остановлен.\nСырой ответ:\n{raw}"
             )
-            return
+            raise AccountPipelineError("Нет HEX/DC от Lolz")
 
         bought_client = await connect_from_hex_dc(hex_key_bought, int(dc_id_bought))
+        new_client = None
         try:
+            await self.send_log(f"🔒 #{item_id}: завершаю чужие сессии...")
             await terminate_other_sessions(bought_client)
             await db.update_purchase_status(item_id, "sessions_terminated")
 
+            await self.send_log(f"🆕 #{item_id}: создаю новую сессию (жду код в 777000)...")
             try:
-                new_client = await create_new_session(bought_client, phone)
+                new_client = await create_new_session(
+                    bought_client,
+                    phone,
+                    password=cloud_password,
+                )
             except AccountPipelineError as e:
                 await db.update_purchase_status(item_id, "error", str(e))
                 await self.send_log(
                     f"❌ #{item_id}: не удалось создать новую сессию ({e}). "
-                    f"Купленная сессия НЕ завершена — остановлен."
+                    f"Купленная сессия НЕ завершена."
                 )
-                return
+                raise
 
+            hex_key, dc_id = await get_auth_hex_and_dc(new_client)
+
+            await self.send_log(f"🚪 #{item_id}: завершаю купленную сессию...")
+            await terminate_this_session(bought_client)
+            bought_client = None
+            await db.update_purchase_status(item_id, "relogged")
+
+            await self.send_log(f"🧹 #{item_id}: чищу чаты и контакты...")
+            await cleanup_account(new_client)
+            await db.update_purchase_status(item_id, "cleaned")
+
+            sell_price = float(await db.get_setting("sell_price"))
+            title_tpl = await db.get_setting("title_template")
             try:
-                hex_key, dc_id = await get_auth_hex_and_dc(new_client)
-                await terminate_this_session(bought_client)
-                await db.update_purchase_status(item_id, "relogged")
-
-                await cleanup_account(new_client)
-                await db.update_purchase_status(item_id, "cleaned")
-
-                sell_price = float(await db.get_setting("sell_price"))
-                title_tpl = await db.get_setting("title_template")
                 title = title_tpl.format(code=country_code or "?", country=country)
+            except Exception:
+                title = f"+{country_code or '?'} {country} | Чистый"
 
-                after_purchase_note = await db.get_setting("sell_description")
-                buyer_note = await db.get_setting("sell_buyer_note")
-                information = f"{after_purchase_note}\n{buyer_note}"
+            after_purchase_note = await db.get_setting("sell_description")
+            buyer_note = await db.get_setting("sell_buyer_note")
+            information = f"{after_purchase_note}\n{buyer_note}".strip()
 
-                await self.lolz.list_for_sale(
-                    title=title, price=sell_price, description="",
-                    information=information, hex_key=hex_key, dc_id=dc_id,
-                )
-                await db.update_purchase_status(item_id, "listed")
-                await self.send_log(f"💰 Аккаунт #{item_id} выставлен на продажу за {sell_price}₽: {title}")
-            finally:
-                await new_client.disconnect()
+            await self.send_log(f"📤 #{item_id}: выставляю на продажу за {sell_price}₽...")
+            await self.lolz.list_for_sale(
+                title=title,
+                price=sell_price,
+                description="",
+                information=information,
+                hex_key=hex_key,
+                dc_id=dc_id,
+            )
+            await db.update_purchase_status(item_id, "listed")
+            await self.send_log(
+                f"💰 Аккаунт #{item_id} выставлен на продажу за {sell_price}₽:\n{title}"
+            )
         finally:
-            await bought_client.disconnect()
+            if new_client is not None:
+                try:
+                    await new_client.disconnect()
+                except Exception:
+                    pass
+            if bought_client is not None:
+                try:
+                    await bought_client.disconnect()
+                except Exception:
+                    pass
