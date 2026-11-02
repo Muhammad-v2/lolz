@@ -7,6 +7,7 @@ Lolz отдаёт купленный аккаунт в виде HEX (auth_key) +
 """
 import asyncio
 import re
+from datetime import datetime, timezone
 from telethon import TelegramClient
 from telethon.sessions import MemorySession
 from telethon.crypto import AuthKey
@@ -63,8 +64,9 @@ async def create_new_session(client_for_code_receiving: TelegramClient, phone: s
     new_client = TelegramClient(MemorySession(), API_ID, API_HASH)
     await new_client.connect()
 
+    request_time = datetime.now(timezone.utc)
     sent = await new_client.send_code_request(phone)
-    code = await _wait_for_code(client_for_code_receiving)
+    code = await _wait_for_code(client_for_code_receiving, after=request_time)
     if not code:
         raise AccountPipelineError("Код входа не пришёл вовремя")
 
@@ -79,14 +81,21 @@ async def create_new_session(client_for_code_receiving: TelegramClient, phone: s
     return new_client
 
 
-async def _wait_for_code(client: TelegramClient, timeout: int = 60) -> str | None:
+async def _wait_for_code(client: TelegramClient, after: datetime, timeout: int = 90) -> str | None:
+    """
+    Ищет код входа в чате 777000, но только среди сообщений, пришедших
+    ПОСЛЕ момента запроса кода (after) — иначе можно случайно подхватить
+    старый, уже истёкший код из этого же чата.
+    """
     deadline = asyncio.get_event_loop().time() + timeout
     seen_ids = set()
     while asyncio.get_event_loop().time() < deadline:
-        async for msg in client.iter_messages(TELEGRAM_SERVICE_ID, limit=5):
+        async for msg in client.iter_messages(TELEGRAM_SERVICE_ID, limit=10):
             if msg.id in seen_ids:
                 continue
             seen_ids.add(msg.id)
+            if msg.date is not None and msg.date < after:
+                continue  # старое сообщение, пришло до нашего запроса кода
             if msg.text:
                 m = re.search(r"\b(\d{5,6})\b", msg.text)
                 if m:
