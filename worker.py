@@ -14,6 +14,7 @@ from telethon_actions import (
     get_auth_hex_and_dc,
     terminate_this_session,
     cleanup_account,
+    check_spam_block,
     AccountPipelineError,
 )
 import db
@@ -168,6 +169,9 @@ class Worker:
 
             hex_key, dc_id = await get_auth_hex_and_dc(new_client)
 
+            await self.send_log(f"🔍 #{item_id}: проверяю спам-блок через @SpamBot...")
+            spam_status = await check_spam_block(new_client)
+
             await self.send_log(f"🚪 #{item_id}: завершаю купленную сессию...")
             await terminate_this_session(bought_client)
             bought_client = None
@@ -192,7 +196,7 @@ class Worker:
             information = f"{after_purchase_note}\n{buyer_note}".strip()
 
             await self.send_log(f"📤 #{item_id}: выставляю на продажу за {sell_price}₽...")
-            await self.lolz.list_for_sale(
+            sell_result = await self.lolz.list_for_sale(
                 title=title,
                 price=sell_price,
                 description="",
@@ -201,6 +205,34 @@ class Worker:
                 dc_id=dc_id,
             )
             await db.update_purchase_status(item_id, "listed")
+
+            # id нового выставленного лота может называться по-разному —
+            # пробуем несколько вариантов, как и для других полей API.
+            sell_item_id = None
+            for key in ("item_id", "itemId", "id"):
+                val = sell_result.get(key) if isinstance(sell_result, dict) else None
+                if val:
+                    sell_item_id = int(val)
+                    break
+            if sell_item_id is None and isinstance(sell_result, dict):
+                nested = sell_result.get("item")
+                if isinstance(nested, dict):
+                    sell_item_id = nested.get("item_id") or nested.get("itemId")
+                    if sell_item_id:
+                        sell_item_id = int(sell_item_id)
+
+            await db.set_purchase_extra(
+                item_id,
+                sell_item_id=sell_item_id,
+                sell_price=sell_price,
+                buy_url=f"https://lzt.market/{item_id}/",
+                sell_url=f"https://lzt.market/{sell_item_id}/" if sell_item_id else None,
+                hex_key=hex_key,
+                dc_id=dc_id,
+                telegram_user_id=str(data.get("telegram_id") or data.get("telegramId") or ""),
+                spam_status=spam_status,
+            )
+
             await self.send_log(
                 f"💰 Аккаунт #{item_id} выставлен на продажу за {sell_price}₽:\n{title}"
             )
