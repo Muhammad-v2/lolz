@@ -6,6 +6,8 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from decimal import Decimal
+
 from lztmarketapi import (
     AsyncLZTMarket,
     CategoryName,
@@ -15,6 +17,7 @@ from lztmarketapi import (
     APIError,
     RateLimitError,
     StatusResponse,
+    EditItemRequest,
 )
 
 from config import LOLZ_TOKEN, ALLOWED_ORIGINS, SECRET_WORD
@@ -397,6 +400,17 @@ class LolzClient:
         except (APIError, RateLimitError) as e:
             raise LolzError(f"Не удалось выставить лот: {e}") from e
         return result.model_dump()
+
+    async def edit_item_price(self, item_id: int, new_price: float):
+        """Меняет цену уже выставленного на продажу лота (кнопка
+        «Изменить цену» в карточке товара в боте)."""
+        try:
+            result = await self._market.items.edit(
+                item_id, EditItemRequest(price=Decimal(str(new_price))),
+            )
+        except (APIError, RateLimitError) as e:
+            raise LolzError(f"Не удалось изменить цену: {e}") from e
+        return result.model_dump() if hasattr(result, "model_dump") else result
 
     async def get_balance(self) -> float:
         try:
