@@ -333,3 +333,62 @@ async def cleanup_account(client: TelegramClient) -> None:
         log.warning("Ошибка при удалении контактов: %s", e)
 
     log.info("Очистка аккаунта завершена")
+
+# ---------- Проверка спам-блока через официального @SpamBot ----------
+
+SPAMBOT_USERNAME = "SpamBot"
+
+
+async def check_spam_block(client: TelegramClient, timeout: int = 20) -> str:
+    """
+    Пишет официальному @SpamBot «/start» и разбирает ответ, чтобы узнать,
+    есть ли на аккаунте ограничения (спам-блок). Возвращает короткую
+    метку: 'free' (ограничений нет), 'limited' (есть ограничения) или
+    'unknown' (не удалось проверить — например, SpamBot не ответил).
+    Используется вместо того, чтобы верить заявлению продавца.
+    """
+    try:
+        bot_entity = await client.get_entity(SPAMBOT_USERNAME)
+    except Exception as e:
+        log.warning("Не удалось найти @%s: %s", SPAMBOT_USERNAME, e)
+        return "unknown"
+
+    try:
+        await client.send_message(bot_entity, "/start")
+    except FloodWaitError as e:
+        log.warning("FloodWait при проверке спам-блока: %ss", e.seconds)
+        return "unknown"
+    except Exception as e:
+        log.warning("Не удалось написать @%s: %s", SPAMBOT_USERNAME, e)
+        return "unknown"
+
+    deadline = asyncio.get_event_loop().time() + timeout
+    seen_ids: set[int] = set()
+    while asyncio.get_event_loop().time() < deadline:
+        try:
+            async for msg in client.iter_messages(bot_entity, limit=5):
+                if msg.id in seen_ids:
+                    continue
+                seen_ids.add(msg.id)
+                text = (msg.text or "").lower()
+                if not text:
+                    continue
+                # SpamBot отвечает по-разному в зависимости от языка аккаунта,
+                # поэтому проверяем по ключевым словам на нескольких языках.
+                if any(p in text for p in (
+                    "good news", "no limits", "не ограничен",
+                    "хороших новостей", "ограничени", "свободен",
+                )) and not any(p in text for p in (
+                    "temporary", "limited", "ограничен", "restrict",
+                )):
+                    return "free"
+                if any(p in text for p in (
+                    "temporarily limited", "limited", "ограничен",
+                    "restrict", "read-only",
+                )):
+                    return "limited"
+        except Exception:
+            pass
+        await asyncio.sleep(1.5)
+
+    return "unknown"
