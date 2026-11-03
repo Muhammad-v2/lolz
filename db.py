@@ -56,6 +56,21 @@ async def init_db():
             "INSERT INTO settings (key, value) VALUES ('worker_enabled', '1') "
             "ON CONFLICT (key) DO NOTHING"
         )
+        # Доп. поля для карточки товара в боте (ссылки, данные входа,
+        # статус спам-блока, цена продажи, id выставленного лота).
+        # ALTER ... ADD COLUMN IF NOT EXISTS безопасен и ничего не ломает
+        # в уже работающей таблице.
+        for col_def in (
+            "sell_item_id BIGINT",
+            "sell_price NUMERIC",
+            "buy_url TEXT",
+            "sell_url TEXT",
+            "hex_key TEXT",
+            "dc_id INT",
+            "telegram_user_id TEXT",
+            "spam_status TEXT",
+        ):
+            await con.execute(f"ALTER TABLE purchases ADD COLUMN IF NOT EXISTS {col_def}")
 
 
 async def get_setting(key: str) -> str:
@@ -178,3 +193,68 @@ async def recent_purchases(limit: int = 10):
         return await con.fetch(
             "SELECT * FROM purchases ORDER BY bought_at DESC LIMIT $1", limit
         )
+
+
+# ---------- Карточка товара (доп. данные для бота) ----------
+
+async def set_purchase_extra(
+    item_id: int,
+    *,
+    sell_item_id: int | None = None,
+    sell_price: float | None = None,
+    buy_url: str | None = None,
+    sell_url: str | None = None,
+    hex_key: str | None = None,
+    dc_id: int | None = None,
+    telegram_user_id: str | None = None,
+    spam_status: str | None = None,
+):
+    """Точечно дополняет уже существующую запись покупки — только те
+    поля, что переданы (остальные не трогает)."""
+    fields = {
+        "sell_item_id": sell_item_id,
+        "sell_price": sell_price,
+        "buy_url": buy_url,
+        "sell_url": sell_url,
+        "hex_key": hex_key,
+        "dc_id": dc_id,
+        "telegram_user_id": telegram_user_id,
+        "spam_status": spam_status,
+    }
+    fields = {k: v for k, v in fields.items() if v is not None}
+    if not fields:
+        return
+    set_clause = ", ".join(f"{k}=${i+2}" for i, k in enumerate(fields))
+    values = list(fields.values())
+    async with _pool.acquire() as con:
+        await con.execute(
+            f"UPDATE purchases SET {set_clause}, updated_at=now() WHERE item_id=$1",
+            item_id, *values,
+        )
+
+
+async def get_purchase(item_id: int):
+    async with _pool.acquire() as con:
+        return await con.fetchrow("SELECT * FROM purchases WHERE item_id=$1", item_id)
+
+
+async def list_listed_purchases(limit: int = 50):
+    """Товары, которые сейчас выставлены на продажу (статус 'listed')."""
+    async with _pool.acquire() as con:
+        return await con.fetch(
+            "SELECT * FROM purchases WHERE status='listed' "
+            "ORDER BY updated_at DESC LIMIT $1", limit
+        )
+
+
+async def list_sold_purchases(limit: int = 50):
+    """Товары, помеченные как проданные (статус 'sold')."""
+    async with _pool.acquire() as con:
+        return await con.fetch(
+            "SELECT * FROM purchases WHERE status='sold' "
+            "ORDER BY updated_at DESC LIMIT $1", limit
+        )
+
+
+async def mark_sold(item_id: int):
+    await update_purchase_status(item_id, "sold")
