@@ -8,16 +8,30 @@ from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import (
+    Message, ReplyKeyboardMarkup, KeyboardButton,
+    InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery,
+)
 
 from config import BOT_TOKEN, ADMIN_ID
 import db
+from lolz_client import LolzClient, LolzError
 
 log = logging.getLogger("bot")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 dp.message.filter(F.from_user.id == ADMIN_ID)
+dp.callback_query.filter(F.from_user.id == ADMIN_ID)
+
+_lolz_client: LolzClient | None = None
+
+
+def _get_lolz_client() -> LolzClient:
+    global _lolz_client
+    if _lolz_client is None:
+        _lolz_client = LolzClient()
+    return _lolz_client
 
 
 # ---------- Клавиатура ----------
@@ -28,6 +42,7 @@ MAIN_MENU = ReplyKeyboardMarkup(
         [KeyboardButton(text="💰 Лимит в день"), KeyboardButton(text="📥 Цена покупки")],
         [KeyboardButton(text="📤 Цена продажи"), KeyboardButton(text="📝 Шаблон заголовка")],
         [KeyboardButton(text="⏱ Интервал поиска"), KeyboardButton(text="🎛 Фильтры поиска")],
+        [KeyboardButton(text="📦 На продаже"), KeyboardButton(text="✅ Проданные")],
         [KeyboardButton(text="⏸ Пауза"), KeyboardButton(text="▶️ Запустить")],
         [KeyboardButton(text="❌ Отмена")],
     ],
@@ -60,6 +75,7 @@ CANCEL_KB = ReplyKeyboardMarkup(
 # ---------- Состояния ожидания ввода ----------
 
 class Form(StatesGroup):
+    edit_item_price = State()
     buy_count = State()
     daily_limit = State()
     buy_price = State()
@@ -376,3 +392,149 @@ async def set_session_age(message: Message, state: FSMContext):
     await db.set_setting("session_age_period", parts[1])
     await state.clear()
     await message.answer(f"Возраст сессии: больше {parts[0]} {parts[1]} ✅", reply_markup=FILTERS_MENU)
+
+
+# ---------- Списки товаров: «на продаже» / «проданные» ----------
+
+SPAM_LABEL = {"free": "🟢 нет", "limited": "🔴 есть", "unknown": "⚪️ не проверено"}
+
+
+def _items_list_keyboard(purchases, prefix: str) -> InlineKeyboardMarkup:
+    rows = []
+    row = []
+    for i, p in enumerate(purchases, start=1):
+        row.append(InlineKeyboardButton(text=str(i), callback_data=f"{prefix}:{p['item_id']}"))
+        if len(row) == 5:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.message(F.text == "📦 На продаже")
+async def list_on_sale(message: Message, state: FSMContext):
+    await state.clear()
+    purchases = await db.list_listed_purchases()
+    if not purchases:
+        await message.answer("Сейчас ничего не выставлено на продажу.", reply_markup=MAIN_MENU)
+        return
+    lines = ["Товары на продаже — нажми номер, чтобы открыть карточку:\n"]
+    for i, p in enumerate(purchases, start=1):
+        lines.append(f"{i}. #{p['item_id']} — {p['country'] or '—'}, {p['sell_price'] or '—'}₽")
+    await message.answer(
+        "\n".join(lines),
+        reply_markup=_items_list_keyboard(purchases, "item"),
+    )
+
+
+@dp.message(F.text == "✅ Проданные")
+async def list_sold(message: Message, state: FSMContext):
+    await state.clear()
+    purchases = await db.list_sold_purchases()
+    if not purchases:
+        await message.answer(
+            "Проданных товаров пока нет (статус 'sold' ставится вручную).",
+            reply_markup=MAIN_MENU,
+        )
+        return
+    lines = ["Проданные товары:\n"]
+    for i, p in enumerate(purchases, start=1):
+        lines.append(
+            f"{i}. #{p['item_id']} — куплен за {p['price']}₽, продан за {p['sell_price'] or '—'}₽"
+        )
+    await message.answer(
+        "\n".join(lines),
+        reply_markup=_items_list_keyboard(purchases, "item"),
+    )
+
+
+@dp.callback_query(F.data.startswith("item:"))
+async def show_item_card(callback: CallbackQuery):
+    item_id = int(callback.data.split(":", 1)[1])
+    p = await db.get_purchase(item_id)
+    if not p:
+        await callback.answer("Не найдено", show_alert=True)
+        return
+
+    spam_label = SPAM_LABEL.get(p["spam_status"] or "unknown", "⚪️ не проверено")
+    hex_key = p["hex_key"] or "—"
+    hex_short = (hex_key[:20] + "…") if len(hex_key) > 20 else hex_key
+
+    text = (
+        f"📱 Аккаунт #{item_id}\n\n"
+        f"Телефон: {p['phone'] or '—'}\n"
+        f"User ID: {p['telegram_user_id'] or '—'}\n"
+        f"Страна: {p['country'] or '—'} ({p['country_code'] or '—'})\n"
+        f"Спам-блок: {spam_label}\n\n"
+        f"Куплен за: {p['price']}₽\n"
+        f"Продаётся за: {p['sell_price'] or '—'}₽\n"
+        f"Статус: {p['status']}\n\n"
+        f"HEX: {hex_short}\n"
+        f"DC: {p['dc_id'] or '—'}\n\n"
+        f"🔗 Лот покупки: {p['buy_url'] or f'https://lzt.market/{item_id}/'}\n"
+        f"🔗 Лот продажи: {p['sell_url'] or '—'}"
+    )
+
+    buttons = [
+        [InlineKeyboardButton(text="✏️ Изменить цену", callback_data=f"editprice:{item_id}")],
+    ]
+    if p["status"] == "listed":
+        buttons.append([InlineKeyboardButton(text="✅ Пометить проданным", callback_data=f"marksold:{item_id}")])
+    buttons.append([InlineKeyboardButton(text="📋 Полный HEX (в личку)", callback_data=f"fullhex:{item_id}")])
+
+    await callback.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("fullhex:"))
+async def send_full_hex(callback: CallbackQuery):
+    item_id = int(callback.data.split(":", 1)[1])
+    p = await db.get_purchase(item_id)
+    if not p or not p["hex_key"]:
+        await callback.answer("Нет данных", show_alert=True)
+        return
+    await callback.message.answer(f"HEX для #{item_id}:\n`{p['hex_key']}`\nDC: {p['dc_id']}")
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("marksold:"))
+async def mark_item_sold(callback: CallbackQuery):
+    item_id = int(callback.data.split(":", 1)[1])
+    await db.mark_sold(item_id)
+    await callback.message.answer(f"Аккаунт #{item_id} помечен как проданный ✅")
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("editprice:"))
+async def ask_new_item_price(callback: CallbackQuery, state: FSMContext):
+    item_id = int(callback.data.split(":", 1)[1])
+    await state.set_state(Form.edit_item_price)
+    await state.update_data(edit_item_id=item_id)
+    await callback.message.answer(
+        f"Напиши новую цену для #{item_id} (в рублях):",
+        reply_markup=CANCEL_KB,
+    )
+    await callback.answer()
+
+
+@dp.message(StateFilter(Form.edit_item_price))
+async def set_new_item_price(message: Message, state: FSMContext):
+    if not message.text.replace(".", "", 1).isdigit():
+        await message.answer("Нужно число, например 12.")
+        return
+    data = await state.get_data()
+    item_id = data.get("edit_item_id")
+    new_price = float(message.text)
+
+    try:
+        client = _get_lolz_client()
+        await client.edit_item_price(item_id, new_price)
+    except LolzError as e:
+        await message.answer(f"❌ Не удалось изменить цену: {e}", reply_markup=MAIN_MENU)
+        await state.clear()
+        return
+
+    await db.set_purchase_extra(item_id, sell_price=new_price)
+    await state.clear()
+    await message.answer(f"Цена #{item_id} изменена на {new_price}₽ ✅", reply_markup=MAIN_MENU)
