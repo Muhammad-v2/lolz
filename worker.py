@@ -52,22 +52,12 @@ class Worker:
         if remaining <= 0:
             return
 
-        daily_limit = float(await db.get_setting("daily_limit"))
-        spent_today = await db.get_today_spent()
-        if spent_today >= daily_limit:
-            return
-
         price_min = float(await db.get_setting("buy_min_price"))
         price_max = float(await db.get_setting("buy_max_price"))
         spam = await db.get_setting("filter_spam")
         password = await db.get_setting("filter_password")
         session_age_value = int(await db.get_setting("session_age_value"))
         session_age_period = await db.get_setting("session_age_period")
-
-        max_affordable = daily_limit - spent_today
-        price_max = min(price_max, max_affordable)
-        if price_max < price_min:
-            return
 
         items = await self.lolz.search_telegram_accounts(
             price_min,
@@ -169,8 +159,21 @@ class Worker:
 
             hex_key, dc_id = await get_auth_hex_and_dc(new_client)
 
+            # Сохраняем HEX/DC новой сессии СРАЗУ, до попытки продажи —
+            # если выставление на продажу упадёт (например, временная
+            # ошибка API Lolz), доступ к аккаунту всё равно не потеряется,
+            # его можно будет посмотреть в карточке товара в боте.
+            await db.set_purchase_extra(
+                item_id,
+                hex_key=hex_key,
+                dc_id=dc_id,
+                buy_url=f"https://lzt.market/{item_id}/",
+                telegram_user_id=str(data.get("telegram_id") or data.get("telegramId") or ""),
+            )
+
             await self.send_log(f"🔍 #{item_id}: проверяю спам-блок через @SpamBot...")
             spam_status = await check_spam_block(new_client)
+            await db.set_purchase_extra(item_id, spam_status=spam_status)
 
             await self.send_log(f"🚪 #{item_id}: завершаю купленную сессию...")
             await terminate_this_session(bought_client)
@@ -196,14 +199,42 @@ class Worker:
             information = f"{after_purchase_note}\n{buyer_note}".strip()
 
             await self.send_log(f"📤 #{item_id}: выставляю на продажу за {sell_price}₽...")
-            sell_result = await self.lolz.list_for_sale(
-                title=title,
-                price=sell_price,
-                description="",
-                information=information,
-                hex_key=hex_key,
-                dc_id=dc_id,
-            )
+
+            sell_result = None
+            last_error = None
+            for attempt in range(1, 4):
+                try:
+                    sell_result = await self.lolz.list_for_sale(
+                        title=title,
+                        price=sell_price,
+                        description="",
+                        information=information,
+                        hex_key=hex_key,
+                        dc_id=dc_id,
+                    )
+                    last_error = None
+                    break
+                except LolzError as e:
+                    last_error = e
+                    if "503" in str(e) or "502" in str(e) or "504" in str(e):
+                        # временная ошибка сервера Lolz — пробуем ещё раз
+                        await asyncio.sleep(5 * attempt)
+                        continue
+                    raise
+
+            if sell_result is None:
+                # Продажа не удалась даже после повторов, но аккаунт жив,
+                # почищен и HEX/DC уже сохранены — доступ не потерян.
+                await db.update_purchase_status(item_id, "cleaned_not_listed", str(last_error))
+                await self.send_log(
+                    f"⚠️ #{item_id}: аккаунт готов (HEX/DC сохранены, доступен в "
+                    f"боте через «📦 На продаже» → но он там не появится, т.к. "
+                    f"не выставлен), выставить на продажу не удалось: {last_error}\n"
+                    f"Попробуй выставить вручную на сайте с этими HEX/DC, "
+                    f"или подожди и перезапусти обработку этого лота."
+                )
+                return
+
             await db.update_purchase_status(item_id, "listed")
 
             # id нового выставленного лота может называться по-разному —
