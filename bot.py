@@ -39,10 +39,11 @@ def _get_lolz_client() -> LolzClient:
 MAIN_MENU = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📊 Статус"), KeyboardButton(text="🛒 Очередь покупок")],
-        [KeyboardButton(text="💰 Лимит в день"), KeyboardButton(text="📥 Цена покупки")],
+        [KeyboardButton(text="📥 Цена покупки")],
         [KeyboardButton(text="📤 Цена продажи"), KeyboardButton(text="📝 Шаблон заголовка")],
         [KeyboardButton(text="⏱ Интервал поиска"), KeyboardButton(text="🎛 Фильтры поиска")],
         [KeyboardButton(text="📦 На продаже"), KeyboardButton(text="✅ Проданные")],
+        [KeyboardButton(text="⚠️ Проблемные")],
         [KeyboardButton(text="⏸ Пауза"), KeyboardButton(text="▶️ Запустить")],
         [KeyboardButton(text="❌ Отмена")],
     ],
@@ -77,7 +78,6 @@ CANCEL_KB = ReplyKeyboardMarkup(
 class Form(StatesGroup):
     edit_item_price = State()
     buy_count = State()
-    daily_limit = State()
     buy_price = State()
     sell_price = State()
     title_template = State()
@@ -121,9 +121,17 @@ async def show_status(message: Message):
     enabled = await db.is_enabled()
     purchases = await db.recent_purchases(5)
 
+    try:
+        client = _get_lolz_client()
+        balance = await client.get_balance()
+        balance_line = f"Баланс на Lolz: {balance}₽"
+    except LolzError as e:
+        balance_line = f"Баланс на Lolz: не удалось получить ({e})"
+
     lines = [
         f"Состояние: {'▶️ работает' if enabled else '⏸ на паузе'}",
-        f"Потрачено сегодня: {spent}₽ из {settings.get('daily_limit')}₽",
+        balance_line,
+        f"Потрачено сегодня (всего куплено): {spent}₽",
         f"В очереди на покупку: {remaining}",
         f"Цена покупки: {settings.get('buy_min_price')}–{settings.get('buy_max_price')}₽",
         f"Цена продажи: {settings.get('sell_price')}₽",
@@ -184,28 +192,6 @@ async def pause_worker(message: Message):
 async def resume_worker(message: Message):
     await db.set_enabled(True)
     await message.answer("Поиск и покупка снова работают ▶️", reply_markup=MAIN_MENU)
-
-
-# ---------- Лимит в день ----------
-
-@dp.message(F.text == "💰 Лимит в день")
-async def ask_daily_limit(message: Message, state: FSMContext):
-    current = await db.get_setting("daily_limit")
-    await state.set_state(Form.daily_limit)
-    await message.answer(
-        f"Текущий дневной лимит: {current}₽\nНапиши новое число в рублях.",
-        reply_markup=CANCEL_KB,
-    )
-
-
-@dp.message(StateFilter(Form.daily_limit))
-async def set_daily_limit(message: Message, state: FSMContext):
-    if not message.text.replace(".", "", 1).isdigit():
-        await message.answer("Нужно число, например 30.")
-        return
-    await db.set_setting("daily_limit", message.text)
-    await state.clear()
-    await message.answer(f"Дневной лимит установлен: {message.text}₽ ✅", reply_markup=MAIN_MENU)
 
 
 # ---------- Цена покупки ----------
@@ -449,6 +435,22 @@ async def list_sold(message: Message, state: FSMContext):
     )
 
 
+@dp.message(F.text == "⚠️ Проблемные")
+async def list_problem_items(message: Message, state: FSMContext):
+    await state.clear()
+    purchases = await db.list_problem_purchases()
+    if not purchases:
+        await message.answer("Проблемных аккаунтов нет 👍", reply_markup=MAIN_MENU)
+        return
+    lines = ["Аккаунты с доступом, но без выставления на продажу:\n"]
+    for i, p in enumerate(purchases, start=1):
+        lines.append(f"{i}. #{p['item_id']} — статус: {p['status']}")
+    await message.answer(
+        "\n".join(lines),
+        reply_markup=_items_list_keyboard(purchases, "item"),
+    )
+
+
 @dp.callback_query(F.data.startswith("item:"))
 async def show_item_card(callback: CallbackQuery):
     item_id = int(callback.data.split(":", 1)[1])
@@ -476,11 +478,12 @@ async def show_item_card(callback: CallbackQuery):
         f"🔗 Лот продажи: {p['sell_url'] or '—'}"
     )
 
-    buttons = [
-        [InlineKeyboardButton(text="✏️ Изменить цену", callback_data=f"editprice:{item_id}")],
-    ]
+    buttons = []
     if p["status"] == "listed":
+        buttons.append([InlineKeyboardButton(text="✏️ Изменить цену", callback_data=f"editprice:{item_id}")])
         buttons.append([InlineKeyboardButton(text="✅ Пометить проданным", callback_data=f"marksold:{item_id}")])
+    elif p["hex_key"] and p["status"] not in ("sold",):
+        buttons.append([InlineKeyboardButton(text="🔁 Повторить выставление", callback_data=f"relist:{item_id}")])
     buttons.append([InlineKeyboardButton(text="📋 Полный HEX (в личку)", callback_data=f"fullhex:{item_id}")])
 
     await callback.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
@@ -495,6 +498,52 @@ async def send_full_hex(callback: CallbackQuery):
         await callback.answer("Нет данных", show_alert=True)
         return
     await callback.message.answer(f"HEX для #{item_id}:\n`{p['hex_key']}`\nDC: {p['dc_id']}")
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("relist:"))
+async def retry_listing(callback: CallbackQuery):
+    item_id = int(callback.data.split(":", 1)[1])
+    p = await db.get_purchase(item_id)
+    if not p or not p["hex_key"] or not p["dc_id"]:
+        await callback.answer("Нет сохранённых HEX/DC для повтора", show_alert=True)
+        return
+
+    sell_price = float(await db.get_setting("sell_price"))
+    title_tpl = await db.get_setting("title_template")
+    try:
+        title = title_tpl.format(code=p["country_code"] or "?", country=p["country"] or "—")
+    except Exception:
+        title = f"{p['country_code'] or '?'} {p['country'] or '—'} | Чистый | Не трогал"
+
+    after_purchase_note = await db.get_setting("sell_description")
+    buyer_note = await db.get_setting("sell_buyer_note")
+    information = f"{after_purchase_note}\n{buyer_note}".strip()
+
+    try:
+        client = _get_lolz_client()
+        sell_result = await client.list_for_sale(
+            title=title, price=sell_price, description="", information=information,
+            hex_key=p["hex_key"], dc_id=p["dc_id"],
+        )
+    except LolzError as e:
+        await callback.message.answer(f"❌ Снова не получилось: {e}")
+        await callback.answer()
+        return
+
+    sell_item_id = None
+    for key in ("item_id", "itemId", "id"):
+        val = sell_result.get(key) if isinstance(sell_result, dict) else None
+        if val:
+            sell_item_id = int(val)
+            break
+
+    await db.update_purchase_status(item_id, "listed")
+    await db.set_purchase_extra(
+        item_id, sell_item_id=sell_item_id, sell_price=sell_price,
+        sell_url=f"https://lzt.market/{sell_item_id}/" if sell_item_id else None,
+    )
+    await callback.message.answer(f"✅ Аккаунт #{item_id} выставлен на продажу за {sell_price}₽")
     await callback.answer()
 
 
