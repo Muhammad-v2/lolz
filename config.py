@@ -22,7 +22,6 @@ DEFAULTS = {
     "buy_min_price": 5,
     "buy_max_price": 7,
     "sell_price": 11,
-    "daily_limit": 30,          # лимит трат в рублях на день
     "search_interval_sec": 60,  # как часто искать новые лоты
     "filter_spam": "nomatter",      # спам-блок: yes / no / nomatter
     "filter_password": "no",        # облачный пароль: yes / no / nomatter
