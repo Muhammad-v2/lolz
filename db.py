@@ -258,3 +258,15 @@ async def list_sold_purchases(limit: int = 50):
 
 async def mark_sold(item_id: int):
     await update_purchase_status(item_id, "sold")
+
+
+async def list_problem_purchases(limit: int = 50):
+    """Аккаунты с сохранёнными HEX/DC, которые НЕ выставлены на продажу
+    и не помечены проданными — доступ к ним есть, но нужно разобраться
+    руками (например, продажа упала с ошибкой сервера Lolz)."""
+    async with _pool.acquire() as con:
+        return await con.fetch(
+            "SELECT * FROM purchases WHERE hex_key IS NOT NULL "
+            "AND status NOT IN ('listed', 'sold') "
+            "ORDER BY updated_at DESC LIMIT $1", limit
+        )
