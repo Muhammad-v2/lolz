@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-
 from decimal import Decimal
 
 from lztmarketapi import (
@@ -165,15 +164,41 @@ class LolzClient:
 
     async def buy_item(self, item_id: int, price: float):
         """
-        Fast-buy. При 403 с retry_request — повторяем (так требует API Lolz).
-        price должен совпадать с текущей ценой лота.
+        Fast-buy по доке Lolz:
+        при 403 retry_request — повторять тот же запрос (до 100 раз).
         """
         body: dict = {"price": float(price)}
         if SECRET_WORD:
             body["secret_answer"] = SECRET_WORD
 
+        def _err_blob(e: BaseException) -> str:
+            parts = [str(e)]
+            for attr in (
+                "response", "body", "payload", "data", "content",
+                "message", "errors", "error", "args",
+            ):
+                val = getattr(e, attr, None)
+                if val is None:
+                    continue
+                try:
+                    parts.append(str(val))
+                except Exception:
+                    pass
+            resp = getattr(e, "response", None)
+            if resp is not None:
+                for attr in ("text", "content", "body"):
+                    try:
+                        v = getattr(resp, attr, None)
+                        if v is not None and not callable(v):
+                            parts.append(str(v)[:2000])
+                    except Exception:
+                        pass
+            return " ".join(parts).lower()
+
         last_err = None
-        for attempt in range(1, 31):
+        max_attempts = 100  # официальная дока Lolz: до 100 повторов
+
+        for attempt in range(1, max_attempts + 1):
             try:
                 result = await self._market.general.request(
                     "POST",
@@ -185,34 +210,57 @@ class LolzClient:
                 extra = getattr(result, "model_extra", None)
                 if extra:
                     data.update(extra)
+                if attempt > 1:
+                    log.info("buy_item #%s OK on attempt %s", item_id, attempt)
                 return data
             except (APIError, RateLimitError) as e:
                 last_err = e
-                text = str(e).lower()
-                raw = ""
-                for attr in ("response", "body", "payload", "data"):
-                    val = getattr(e, attr, None)
-                    if val is not None:
-                        raw = str(val)
-                        break
-                combined = f"{text} {raw}".lower()
+                combined = _err_blob(e)
 
-                if "retry_request" in combined or "retry request" in combined:
-                    await asyncio.sleep(min(1.5 + attempt * 0.3, 8))
-                    continue
-
-                if any(x in combined for x in (
-                    "sold", "продан", "deleted", "удалён", "удален", "not available"
-                )):
+                # лот уже купили / удалили — не ретраим
+                sold_markers = (
+                    "item is sold", "item_sold", "already sold",
+                    "продан", "deleted", "удалён", "удален",
+                    "not available", "недоступен",
+                )
+                if any(x in combined for x in sold_markers) and "retry" not in combined:
                     raise LolzError(f"Лот уже недоступен: {e}") from e
 
-                if "403" in combined and attempt < 10:
-                    await asyncio.sleep(min(1.0 + attempt * 0.4, 6))
+                is_retry = (
+                    "retry_request" in combined
+                    or "retry request" in combined
+                    or "retry" in combined
+                    or "403" in combined
+                    or "forbidden" in combined
+                )
+                is_rate = (
+                    "429" in combined
+                    or "rate" in combined
+                    or isinstance(e, RateLimitError)
+                )
+
+                if is_retry or is_rate:
+                    delay = 0.35 if is_retry else min(1.5 + attempt * 0.2, 8)
+                    if attempt in (1, 5, 10, 25, 50) or attempt == max_attempts:
+                        log.warning(
+                            "buy_item #%s attempt %s/%s: %s → sleep %.2fs",
+                            item_id, attempt, max_attempts, str(e)[:200], delay,
+                        )
+                    await asyncio.sleep(delay)
                     continue
 
                 raise LolzError(f"Покупка не удалась: {e}") from e
+            except Exception as e:
+                last_err = e
+                combined = _err_blob(e)
+                if "403" in combined or "retry" in combined:
+                    await asyncio.sleep(0.4)
+                    continue
+                raise LolzError(f"Покупка не удалась: {e}") from e
 
-        raise LolzError(f"Покупка не удалась после ретраев: {last_err}")
+        raise LolzError(
+            f"Покупка не удалась после {max_attempts} попыток: {last_err}"
+        )
 
     async def get_item_login_data(self, item_id: int) -> dict:
         try:
