@@ -24,6 +24,16 @@ from config import LOLZ_TOKEN, ALLOWED_ORIGINS, SECRET_WORD
 log = logging.getLogger("lolz_client")
 
 
+def _describe_api_error(e: BaseException) -> str:
+    """Достаёт настоящий текст ошибки из APIError (поля status_code/error
+    по документации библиотеки), а не общий 'request failed (HTTP 403)'."""
+    status = getattr(e, "status_code", None)
+    detail = getattr(e, "error", None)
+    if detail is not None:
+        return f"{status or ''} {detail}".strip()
+    return str(e)
+
+
 class LolzError(Exception):
     pass
 
@@ -158,7 +168,7 @@ class LolzClient:
         try:
             response = await self._market.categories.search(CategoryName.TELEGRAM, params)
         except (APIError, RateLimitError) as e:
-            raise LolzError(f"Поиск не удался: {e}") from e
+            raise LolzError(f"Поиск не удался: {_describe_api_error(e)}") from e
 
         return [item.model_dump() for item in response.items]
 
@@ -224,14 +234,15 @@ class LolzClient:
                     "not available", "недоступен",
                 )
                 if any(x in combined for x in sold_markers) and "retry" not in combined:
-                    raise LolzError(f"Лот уже недоступен: {e}") from e
+                    raise LolzError(f"Лот уже недоступен: {_describe_api_error(e)}") from e
 
+                # ВАЖНО: ретраим только по официальному сигналу "retry_request",
+                # а не по любому 403 — обычный 403 (нет баланса, нет прав у
+                # токена, нет доступа к Маркету) никогда сам не пройдёт,
+                # и 100 попыток только тратят время, скрывая причину.
                 is_retry = (
                     "retry_request" in combined
                     or "retry request" in combined
-                    or "retry" in combined
-                    or "403" in combined
-                    or "forbidden" in combined
                 )
                 is_rate = (
                     "429" in combined
@@ -249,24 +260,25 @@ class LolzClient:
                     await asyncio.sleep(delay)
                     continue
 
-                raise LolzError(f"Покупка не удалась: {e}") from e
+                raise LolzError(f"Покупка не удалась: {_describe_api_error(e)}") from e
             except Exception as e:
                 last_err = e
                 combined = _err_blob(e)
-                if "403" in combined or "retry" in combined:
+                if "retry_request" in combined or "retry request" in combined:
                     await asyncio.sleep(0.4)
                     continue
-                raise LolzError(f"Покупка не удалась: {e}") from e
+                raise LolzError(f"Покупка не удалась: {_describe_api_error(e)}") from e
 
         raise LolzError(
-            f"Покупка не удалась после {max_attempts} попыток: {last_err}"
+            f"Покупка не удалась после {max_attempts} попыток: "
+            f"{_describe_api_error(last_err) if last_err else '—'}"
         )
 
     async def get_item_login_data(self, item_id: int) -> dict:
         try:
             response = await self._market.items.get(item_id)
         except (APIError, RateLimitError) as e:
-            raise LolzError(f"Не удалось получить данные лота: {e}") from e
+            raise LolzError(f"Не удалось получить данные лота: {_describe_api_error(e)}") from e
 
         data = response.item.model_dump()
         extra = getattr(response.item, "model_extra", None)
@@ -446,7 +458,7 @@ class LolzClient:
                 json=payload,
             )
         except (APIError, RateLimitError) as e:
-            raise LolzError(f"Не удалось выставить лот: {e}") from e
+            raise LolzError(f"Не удалось выставить лот: {_describe_api_error(e)}") from e
         return result.model_dump()
 
     async def edit_item_price(self, item_id: int, new_price: float):
@@ -457,12 +469,12 @@ class LolzClient:
                 item_id, EditItemRequest(price=Decimal(str(new_price))),
             )
         except (APIError, RateLimitError) as e:
-            raise LolzError(f"Не удалось изменить цену: {e}") from e
+            raise LolzError(f"Не удалось изменить цену: {_describe_api_error(e)}") from e
         return result.model_dump() if hasattr(result, "model_dump") else result
 
     async def get_balance(self) -> float:
         try:
             response = await self._market.profile.get()
         except (APIError, RateLimitError) as e:
-            raise LolzError(f"Не удалось получить баланс: {e}") from e
+            raise LolzError(f"Не удалось получить баланс: {_describe_api_error(e)}") from e
         return float(response.user.balance)
