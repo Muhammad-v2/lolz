@@ -11,6 +11,13 @@ API_HASH = os.getenv("API_HASH", "")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 SECRET_WORD = os.getenv("SECRET_WORD", "Зенит")
 
+# Почта, которую бот будет автоматически привязывать как email для входа
+# на каждом купленном аккаунте. Если EMAIL_ADDRESS не задан — этот шаг
+# просто пропускается, остальной пайплайн работает как раньше.
+EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS", "")
+EMAIL_APP_PASSWORD = os.getenv("EMAIL_APP_PASSWORD", "")
+EMAIL_IMAP_SERVER = os.getenv("EMAIL_IMAP_SERVER", "imap.gmail.com")
+
 # Категории лотов на lzt.market, которые разрешено покупать.
 # Точные значения — из официальной документации Market API.
 # ВАЖНО: категории "stealer" (стиллер) и "phishing" (фишинг) никогда
