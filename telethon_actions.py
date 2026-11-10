@@ -28,6 +28,9 @@ from telethon.tl.functions.auth import LogOutRequest, ResetAuthorizationsRequest
 from telethon.tl.functions.contacts import DeleteContactsRequest, GetContactsRequest
 from telethon.tl.functions.channels import LeaveChannelRequest
 from telethon.tl.functions.messages import DeleteHistoryRequest
+from telethon.tl.functions.account import SendVerifyEmailCodeRequest, VerifyEmailRequest
+from telethon.tl.types.account import EmailVerifyPurposeLoginChange
+from telethon.tl.types import EmailVerificationCode
 
 from config import API_ID, API_HASH
 
@@ -392,3 +395,32 @@ async def check_spam_block(client: TelegramClient, timeout: int = 20) -> str:
         await asyncio.sleep(1.5)
 
     return "unknown"
+
+
+# ---------- Привязка email для входа (автоматически, через IMAP) ----------
+
+class EmailChangeError(Exception):
+    pass
+
+
+async def request_email_change(client: TelegramClient, new_email: str):
+    """Запрашивает привязку нового email для входа — Telegram пришлёт
+    код подтверждения на этот email (его дальше читает email_client.py)."""
+    try:
+        await client(SendVerifyEmailCodeRequest(
+            purpose=EmailVerifyPurposeLoginChange(),
+            email=new_email,
+        ))
+    except Exception as e:
+        raise EmailChangeError(f"Не удалось запросить смену email: {e}") from e
+
+
+async def confirm_email_change(client: TelegramClient, code: str):
+    """Подтверждает смену email кодом, пришедшим на почту."""
+    try:
+        await client(VerifyEmailRequest(
+            purpose=EmailVerifyPurposeLoginChange(),
+            verification=EmailVerificationCode(code=code),
+        ))
+    except Exception as e:
+        raise EmailChangeError(f"Не удалось подтвердить email: {e}") from e
