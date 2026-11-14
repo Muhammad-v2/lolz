@@ -206,7 +206,7 @@ class LolzClient:
             return " ".join(parts).lower()
 
         last_err = None
-        max_attempts = 100  # официальная дока Lolz: до 100 повторов
+        max_attempts = 10  # ретраим только настоящие временные ошибки — 10 с запасом
 
         for attempt in range(1, max_attempts + 1):
             try:
@@ -244,9 +244,15 @@ class LolzClient:
                     "retry_request" in combined
                     or "retry request" in combined
                 )
+                # ВАЖНО: НЕ проверяем просто "rate" — это слово есть в каждом
+                # ответе API внутри системного поля "rate_limit" (обычная
+                # информация о лимитах, не ошибка), из-за чего раньше
+                # ЛЮБАЯ ошибка (включая 403 "нет прав") ошибочно считалась
+                # превышением лимита и ретраилась все 100 попыток подряд.
                 is_rate = (
                     "429" in combined
-                    or "rate" in combined
+                    or "rate limit exceeded" in combined
+                    or "too many requests" in combined
                     or isinstance(e, RateLimitError)
                 )
 
