@@ -15,15 +15,9 @@ from telethon_actions import (
     terminate_this_session,
     cleanup_account,
     check_spam_block,
-    request_email_change,
-    confirm_email_change,
-    EmailChangeError,
     AccountPipelineError,
 )
-from email_client import wait_for_email_code
-from config import EMAIL_ADDRESS
 import db
-import time
 
 log = logging.getLogger("worker")
 
@@ -76,62 +70,40 @@ class Worker:
         if not items:
             return
 
-        item = items[0]
-        item_id = item.get("item_id") or item.get("itemId") or item.get("id")
-        if item_id is None:
-            await self.send_log(f"⚠️ Странный лот без id: {str(item)[:500]}")
-            return
-        item_id = int(item_id)
-        price = float(item.get("price", price_max))
+        # Пробуем несколько лотов из текущего поиска подряд, если верхний
+        # уже перехватили другие покупатели — чтобы не ждать целый
+        # интервал поиска заново ради одной неудачной попытки.
+        for item in items[:5]:
+            item_id = item.get("item_id") or item.get("itemId") or item.get("id")
+            if item_id is None:
+                continue
+            item_id = int(item_id)
+            price = float(item.get("price", price_max))
 
-        try:
-            await self._buy_and_process(item_id, price, item)
-        except LolzError as e:
-            msg = str(e)
-            low = msg.lower()
-            if "продан" in low or "sold" in low or "already" in low or "недоступен" in low:
-                await self.send_log(f"ℹ️ Лот #{item_id} уже купили раньше нас, пробую другой")
-                return
-            log.exception("Ошибка обработки лота %s", item_id)
             try:
-                await db.update_purchase_status(item_id, "error", msg)
-            except Exception:
-                pass
-            await self.send_log(f"❌ Ошибка обработки аккаунта #{item_id}: {msg}")
-        except Exception as e:
-            log.exception("Ошибка обработки лота %s", item_id)
-            try:
-                await db.update_purchase_status(item_id, "error", str(e))
-            except Exception:
-                pass
-            await self.send_log(f"❌ Ошибка обработки аккаунта #{item_id}: {e}")
-
-    async def _attach_email(self, item_id: int, client):
-        """Привязывает EMAIL_ADDRESS как email для входа на аккаунте.
-        Код подтверждения Telegram пришлёт на эту почту — читаем его
-        сами через IMAP (email_client.py), без участия человека.
-        Если что-то не получится — просто пропускаем этот шаг и идём
-        дальше (не ломаем остальной пайплайн)."""
-        try:
-            await self.send_log(f"✉️ #{item_id}: привязываю email {EMAIL_ADDRESS}...")
-            request_time = time.time()
-            await request_email_change(client, EMAIL_ADDRESS)
-
-            code = await wait_for_email_code(after_ts=request_time, timeout=90)
-            if not code:
-                await self.send_log(
-                    f"⚠️ #{item_id}: код подтверждения email не пришёл за 90 сек, "
-                    f"пропускаю привязку почты (остальное продолжаю)."
-                )
+                await self._buy_and_process(item_id, price, item)
+                return  # успех — на этом тике больше ничего не делаем
+            except LolzError as e:
+                msg = str(e)
+                low = msg.lower()
+                if "продан" in low or "sold" in low or "already" in low or "недоступен" in low:
+                    await self.send_log(f"ℹ️ Лот #{item_id} уже купили раньше нас, пробую следующий")
+                    continue  # пробуем следующий лот из этого же поиска, сразу
+                log.exception("Ошибка обработки лота %s", item_id)
+                try:
+                    await db.update_purchase_status(item_id, "error", msg)
+                except Exception:
+                    pass
+                await self.send_log(f"❌ Ошибка обработки аккаунта #{item_id}: {msg}")
                 return
-
-            await confirm_email_change(client, code)
-            await self.send_log(f"✅ #{item_id}: email успешно привязан")
-        except EmailChangeError as e:
-            await self.send_log(f"⚠️ #{item_id}: не удалось привязать email ({e}), продолжаю без этого")
-        except Exception as e:
-            log.exception("Ошибка привязки email для %s", item_id)
-            await self.send_log(f"⚠️ #{item_id}: ошибка при привязке email ({e}), продолжаю без этого")
+            except Exception as e:
+                log.exception("Ошибка обработки лота %s", item_id)
+                try:
+                    await db.update_purchase_status(item_id, "error", str(e))
+                except Exception:
+                    pass
+                await self.send_log(f"❌ Ошибка обработки аккаунта #{item_id}: {e}")
+                return
 
     async def _buy_and_process(self, item_id: int, price: float, item: dict):
         await self.send_log(f"🛒 Покупаю лот #{item_id} за {price}₽...")
@@ -204,9 +176,13 @@ class Worker:
                 telegram_user_id=str(data.get("telegram_id") or data.get("telegramId") or ""),
             )
 
-            await self.send_log(f"🔍 #{item_id}: проверяю спам-блок через @SpamBot...")
-            spam_status = await check_spam_block(new_client)
-            await db.set_purchase_extra(item_id, spam_status=spam_status)
+            check_spam = (await db.get_setting("check_spam_block")) != "0"
+            if check_spam:
+                await self.send_log(f"🔍 #{item_id}: проверяю спам-блок через @SpamBot...")
+                spam_status = await check_spam_block(new_client)
+                await db.set_purchase_extra(item_id, spam_status=spam_status)
+            else:
+                spam_status = "unknown"
 
             await self.send_log(f"🚪 #{item_id}: завершаю купленную сессию...")
             await terminate_this_session(bought_client)
@@ -216,9 +192,6 @@ class Worker:
             await self.send_log(f"🧹 #{item_id}: чищу чаты и контакты...")
             await cleanup_account(new_client)
             await db.update_purchase_status(item_id, "cleaned")
-
-            if EMAIL_ADDRESS:
-                await self._attach_email(item_id, new_client)
 
             sell_price = float(await db.get_setting("sell_price"))
             title_tpl = await db.get_setting("title_template")
