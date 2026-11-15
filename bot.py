@@ -54,6 +54,7 @@ FILTERS_MENU = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="🚫 Спам-блок"), KeyboardButton(text="🔒 Пароль")],
         [KeyboardButton(text="⏳ Возраст сессии")],
+        [KeyboardButton(text="🔍 Проверка через SpamBot")],
         [KeyboardButton(text="⬅️ Назад в меню")],
     ],
     resize_keyboard=True,
@@ -299,9 +300,23 @@ async def open_filters(message: Message, state: FSMContext):
         "Текущие фильтры поиска:\n"
         f"🚫 Спам-блок: {YES_NO_LABEL.get(spam, spam)}\n"
         f"🔒 Пароль: {YES_NO_LABEL.get(password, password)}\n"
-        f"⏳ Возраст сессии: больше {sess_v} {sess_p}\n\n"
+        f"⏳ Возраст сессии: больше {sess_v} {sess_p}\n"
+        f"🔍 Проверка через SpamBot: {'включена (дольше, точнее)' if (await db.get_setting('check_spam_block')) != '0' else 'выключена (быстрее)'}\n\n"
         f"Цена покупки настраивается отдельной кнопкой «📥 Цена покупки».\n\n"
         f"Выбери, что изменить:",
+        reply_markup=FILTERS_MENU,
+    )
+
+
+@dp.message(F.text == "🔍 Проверка через SpamBot")
+async def toggle_spam_check(message: Message):
+    current = (await db.get_setting("check_spam_block")) != "0"
+    new_value = "0" if current else "1"
+    await db.set_setting("check_spam_block", new_value)
+    label = "включена" if new_value == "1" else "выключена"
+    await message.answer(
+        f"Проверка спам-блока через @SpamBot теперь {label}.\n"
+        f"{'Обработка каждого аккаунта будет чуть дольше, зато точнее.' if new_value == '1' else 'Обработка будет быстрее, но статус спам-блока будет неизвестен.'}",
         reply_markup=FILTERS_MENU,
     )
 
