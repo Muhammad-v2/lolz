@@ -118,6 +118,7 @@ async def cmd_cancel(message: Message, state: FSMContext):
 async def show_status(message: Message):
     settings = await db.get_settings()
     spent = await db.get_today_spent()
+    bought_today = await db.get_today_count()
     remaining = await db.get_queue()
     enabled = await db.is_enabled()
     purchases = await db.recent_purchases(5)
@@ -132,7 +133,7 @@ async def show_status(message: Message):
     lines = [
         f"Состояние: {'▶️ работает' if enabled else '⏸ на паузе'}",
         balance_line,
-        f"Потрачено сегодня (всего куплено): {spent}₽",
+        f"Куплено сегодня: {bought_today} аккаунт(ов) на {spent}₽",
         f"В очереди на покупку: {remaining}",
         f"Цена покупки: {settings.get('buy_min_price')}–{settings.get('buy_max_price')}₽",
         f"Цена продажи: {settings.get('sell_price')}₽",
