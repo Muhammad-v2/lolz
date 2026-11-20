@@ -38,9 +38,11 @@ async def init_db():
         await con.execute("""
             CREATE TABLE IF NOT EXISTS daily_spend (
                 day DATE PRIMARY KEY,
-                spent NUMERIC NOT NULL DEFAULT 0
+                spent NUMERIC NOT NULL DEFAULT 0,
+                count INT NOT NULL DEFAULT 0
             );
         """)
+        await con.execute("ALTER TABLE daily_spend ADD COLUMN IF NOT EXISTS count INT NOT NULL DEFAULT 0")
         for k, v in DEFAULTS.items():
             await con.execute(
                 "INSERT INTO settings (key, value) VALUES ($1, $2) "
@@ -101,12 +103,22 @@ async def get_today_spent() -> float:
         return float(row["spent"]) if row else 0.0
 
 
+async def get_today_count() -> int:
+    today = datetime.date.today()
+    async with _pool.acquire() as con:
+        row = await con.fetchrow("SELECT count FROM daily_spend WHERE day=$1", today)
+        return int(row["count"]) if row else 0
+
+
 async def add_spent(amount: float):
+    """Добавляет и сумму, и +1 к счётчику купленных сегодня аккаунтов."""
     today = datetime.date.today()
     async with _pool.acquire() as con:
         await con.execute("""
-            INSERT INTO daily_spend (day, spent) VALUES ($1, $2)
-            ON CONFLICT (day) DO UPDATE SET spent = daily_spend.spent + $2
+            INSERT INTO daily_spend (day, spent, count) VALUES ($1, $2, 1)
+            ON CONFLICT (day) DO UPDATE SET
+                spent = daily_spend.spent + $2,
+                count = daily_spend.count + 1
         """, today, amount)
 
 
