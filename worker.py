@@ -15,9 +15,15 @@ from telethon_actions import (
     terminate_this_session,
     cleanup_account,
     check_spam_block,
+    request_email_change,
+    confirm_email_change,
+    EmailChangeError,
     AccountPipelineError,
 )
+from email_client import wait_for_email_code
+from config import EMAIL_ADDRESS
 import db
+import time
 
 log = logging.getLogger("worker")
 
@@ -104,6 +110,33 @@ class Worker:
                     pass
                 await self.send_log(f"❌ Ошибка обработки аккаунта #{item_id}: {e}")
                 return
+
+    async def _attach_email(self, item_id: int, client):
+        """Привязывает EMAIL_ADDRESS как email для входа на аккаунте.
+        Код подтверждения Telegram пришлёт на эту почту — читаем его
+        сами через IMAP (email_client.py), без участия человека.
+        Если что-то не получится — пропускаем этот шаг, не ломая
+        остальной пайплайн (аккаунт всё равно выставится на продажу)."""
+        try:
+            await self.send_log(f"✉️ #{item_id}: привязываю email {EMAIL_ADDRESS}...")
+            request_time = time.time()
+            await request_email_change(client, EMAIL_ADDRESS)
+
+            code = await wait_for_email_code(after_ts=request_time, timeout=90)
+            if not code:
+                await self.send_log(
+                    f"⚠️ #{item_id}: код подтверждения email не пришёл за 90 сек, "
+                    f"пропускаю привязку почты."
+                )
+                return
+
+            await confirm_email_change(client, code)
+            await self.send_log(f"✅ #{item_id}: email успешно привязан")
+        except EmailChangeError as e:
+            await self.send_log(f"⚠️ #{item_id}: не удалось привязать email ({e}), продолжаю без этого")
+        except Exception as e:
+            log.exception("Ошибка привязки email для %s", item_id)
+            await self.send_log(f"⚠️ #{item_id}: ошибка при привязке email ({e}), продолжаю без этого")
 
     async def _buy_and_process(self, item_id: int, price: float, item: dict):
         await self.send_log(f"🛒 Покупаю лот #{item_id} за {price}₽...")
@@ -198,6 +231,9 @@ class Worker:
                 await db.set_purchase_extra(item_id, spam_status=spam_status)
             else:
                 spam_status = "unknown"
+
+            if EMAIL_ADDRESS:
+                await self._attach_email(item_id, new_client)
 
             sell_price = float(await db.get_setting("sell_price"))
             title_tpl = await db.get_setting("title_template")
