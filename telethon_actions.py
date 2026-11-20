@@ -292,36 +292,52 @@ async def terminate_this_session(client: TelegramClient) -> None:
         pass
 
 
-async def cleanup_account(client: TelegramClient) -> None:
+async def cleanup_account(client: TelegramClient) -> dict:
+    """
+    Удаляет ВСЕ чаты/группы/каналы, кроме служебного чата Telegram (777000),
+    и чистит контакты. Возвращает отчёт {"deleted": N, "failed": N, "errors": [...]}
+    — чтобы было видно в логах бота, что реально произошло, а не "молча ничего".
+    """
+    report = {"deleted": 0, "failed": 0, "errors": []}
+
+    # Сразу после входа новой/купленной сессии список диалогов может быть ещё
+    # не до конца синхронизирован Telegram'ом — явно запрашиваем полный список
+    # перед тем, как начинать удалять, иначе iter_dialogs() может вернуть пусто.
     try:
-        async for dialog in client.iter_dialogs():
-            if dialog.id == TELEGRAM_SERVICE_ID:
-                continue
-            try:
-                if dialog.is_channel or dialog.is_group:
-                    try:
-                        await client(LeaveChannelRequest(dialog.entity))
-                    except Exception:
-                        pass
-                try:
-                    await client(
-                        DeleteHistoryRequest(
-                            peer=dialog.entity,
-                            max_id=0,
-                            just_clear=False,
-                            revoke=True,
-                        )
-                    )
-                except Exception:
-                    try:
-                        await client.delete_dialog(dialog.entity)
-                    except Exception:
-                        pass
-            except Exception:
-                continue
-            await asyncio.sleep(0.15)
+        await client.get_dialogs(limit=200)
     except Exception as e:
-        log.warning("Ошибка при чистке диалогов: %s", e)
+        log.warning("Не удалось предварительно загрузить диалоги: %s", e)
+
+    dialogs = []
+    try:
+        async for dialog in client.iter_dialogs(limit=200):
+            if dialog.id != TELEGRAM_SERVICE_ID:
+                dialogs.append(dialog)
+    except Exception as e:
+        report["errors"].append(f"не удалось получить список диалогов: {e}")
+        log.warning("Ошибка получения списка диалогов: %s", e)
+        dialogs = []
+
+    for dialog in dialogs:
+        try:
+            # Сначала выходим из группы/канала (если это группа/канал и мы
+            # не просто собеседник), потом удаляем сам диалог с историей.
+            if dialog.is_channel or dialog.is_group:
+                try:
+                    await client(LeaveChannelRequest(dialog.entity))
+                except Exception as e:
+                    # не падаем — иногда leave и не нужен (уже не участник),
+                    # но delete_dialog ниже всё равно должен сработать
+                    log.info("Leave не удался для %s (%s): %s", dialog.id, dialog.name, e)
+
+            await client.delete_dialog(dialog.entity, revoke=True)
+            report["deleted"] += 1
+        except Exception as e:
+            report["failed"] += 1
+            msg = f"{dialog.id} ({dialog.name or '—'}): {e}"
+            report["errors"].append(msg)
+            log.warning("Не удалось удалить диалог %s", msg)
+        await asyncio.sleep(0.3)
 
     try:
         contacts = await client(GetContactsRequest(hash=0))
@@ -330,9 +346,11 @@ async def cleanup_account(client: TelegramClient) -> None:
             await client(DeleteContactsRequest(id=users))
             log.info("Удалено контактов: %s", len(users))
     except Exception as e:
+        report["errors"].append(f"контакты: {e}")
         log.warning("Ошибка при удалении контактов: %s", e)
 
-    log.info("Очистка аккаунта завершена")
+    log.info("Очистка аккаунта: удалено %s, не удалось %s", report["deleted"], report["failed"])
+    return report
 
 # ---------- Проверка спам-блока через официального @SpamBot ----------
 
