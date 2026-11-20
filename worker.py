@@ -143,10 +143,26 @@ class Worker:
         bought_client = await connect_from_hex_dc(hex_key_bought, int(dc_id_bought))
         new_client = None
         try:
+            # 1) Сначала завершаем ВСЕ чужие сессии — возможно только потому,
+            #    что купленной сессии уже больше 24 часов.
             await self.send_log(f"🔒 #{item_id}: завершаю чужие сессии...")
             await terminate_other_sessions(bought_client)
             await db.update_purchase_status(item_id, "sessions_terminated")
 
+            # 2) Чистим чаты/контакты ПРЯМО на купленной сессии (новой пока
+            #    нет) — раньше чистка шла уже после перелогина, но суть та
+            #    же: чистим один раз, пока сессия одна и точно единственная.
+            await self.send_log(f"🧹 #{item_id}: чищу чаты, группы, каналы и контакты...")
+            cleanup_report = await cleanup_account(bought_client)
+            await db.update_purchase_status(item_id, "cleaned")
+            await self.send_log(
+                f"🧹 #{item_id}: удалено диалогов — {cleanup_report['deleted']}, "
+                f"не удалось — {cleanup_report['failed']}"
+                + (f"\nПричины: {cleanup_report['errors'][:5]}" if cleanup_report["errors"] else "")
+            )
+
+            # 3) Теперь создаём НОВУЮ сессию (код читаем из чата 777000 на
+            #    купленной сессии, которая пока ещё жива).
             await self.send_log(f"🆕 #{item_id}: создаю новую сессию (жду код в 777000)...")
             try:
                 new_client = await create_new_session(
@@ -158,16 +174,15 @@ class Worker:
                 await db.update_purchase_status(item_id, "error", str(e))
                 await self.send_log(
                     f"❌ #{item_id}: не удалось создать новую сессию ({e}). "
-                    f"Купленная сессия НЕ завершена."
+                    f"Купленная сессия НЕ завершена — доступ не потерян."
                 )
                 raise
 
             hex_key, dc_id = await get_auth_hex_and_dc(new_client)
 
             # Сохраняем HEX/DC новой сессии СРАЗУ, до попытки продажи —
-            # если выставление на продажу упадёт (например, временная
-            # ошибка API Lolz), доступ к аккаунту всё равно не потеряется,
-            # его можно будет посмотреть в карточке товара в боте.
+            # если выставление на продажу упадёт, доступ всё равно не
+            # потеряется (и купленная сессия ещё жива, см. ниже).
             await db.set_purchase_extra(
                 item_id,
                 hex_key=hex_key,
@@ -183,15 +198,6 @@ class Worker:
                 await db.set_purchase_extra(item_id, spam_status=spam_status)
             else:
                 spam_status = "unknown"
-
-            await self.send_log(f"🚪 #{item_id}: завершаю купленную сессию...")
-            await terminate_this_session(bought_client)
-            bought_client = None
-            await db.update_purchase_status(item_id, "relogged")
-
-            await self.send_log(f"🧹 #{item_id}: чищу чаты и контакты...")
-            await cleanup_account(new_client)
-            await db.update_purchase_status(item_id, "cleaned")
 
             sell_price = float(await db.get_setting("sell_price"))
             title_tpl = await db.get_setting("title_template")
@@ -232,17 +238,26 @@ class Worker:
                     raise
 
             if sell_result is None:
-                # Продажа не удалась даже после повторов, но аккаунт жив,
-                # почищен и HEX/DC уже сохранены — доступ не потерян.
+                # Продажа не удалась даже после повторов. Купленную сессию
+                # НЕ завершаем — обе сессии (купленная и новая) остаются
+                # живыми, доступ не теряется, можно повторить вручную.
                 await db.update_purchase_status(item_id, "cleaned_not_listed", str(last_error))
                 await self.send_log(
-                    f"⚠️ #{item_id}: аккаунт готов (HEX/DC сохранены, доступен в "
-                    f"боте через «📦 На продаже» → но он там не появится, т.к. "
-                    f"не выставлен), выставить на продажу не удалось: {last_error}\n"
-                    f"Попробуй выставить вручную на сайте с этими HEX/DC, "
-                    f"или подожди и перезапусти обработку этого лота."
+                    f"⚠️ #{item_id}: аккаунт готов (HEX/DC сохранены, купленная сессия "
+                    f"НЕ завершена), выставить на продажу не удалось: {last_error}\n"
+                    f"Можно повторить через кнопку «🔁 Повторить выставление» в карточке "
+                    f"аккаунта, в разделе «⚠️ Проблемные»."
                 )
                 return
+
+            # Продажа прошла успешно — ТОЛЬКО ТЕПЕРЬ завершаем купленную
+            # сессию, раз новая сессия точно работает и аккаунт выставлен.
+            await self.send_log(f"🚪 #{item_id}: всё готово, завершаю купленную сессию...")
+            try:
+                await terminate_this_session(bought_client)
+            except Exception as e:
+                await self.send_log(f"⚠️ #{item_id}: не удалось завершить купленную сессию ({e}), не критично")
+            bought_client = None
 
             await db.update_purchase_status(item_id, "listed")
 
