@@ -29,8 +29,7 @@ from telethon.tl.functions.contacts import DeleteContactsRequest, GetContactsReq
 from telethon.tl.functions.channels import LeaveChannelRequest
 from telethon.tl.functions.messages import DeleteHistoryRequest
 from telethon.tl.functions.account import SendVerifyEmailCodeRequest, VerifyEmailRequest
-from telethon.tl.types.account import EmailVerifyPurposeLoginChange
-from telethon.tl.types import EmailVerificationCode
+from telethon.tl.types import EmailVerifyPurposeLoginChange, EmailVerificationCode
 
 from config import API_ID, API_HASH
 
