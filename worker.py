@@ -104,11 +104,12 @@ class Worker:
                 return
             except Exception as e:
                 log.exception("Ошибка обработки лота %s", item_id)
+                err_text = self._describe_pipeline_error(e)
                 try:
-                    await db.update_purchase_status(item_id, "error", str(e))
+                    await db.update_purchase_status(item_id, "error", err_text)
                 except Exception:
                     pass
-                await self.send_log(f"❌ Ошибка обработки аккаунта #{item_id}: {e}")
+                await self.send_log(f"❌ Ошибка обработки аккаунта #{item_id}: {err_text}")
                 return
 
     async def _attach_email(self, item_id: int, client):
@@ -137,6 +138,26 @@ class Worker:
         except Exception as e:
             log.exception("Ошибка привязки email для %s", item_id)
             await self.send_log(f"⚠️ #{item_id}: ошибка при привязке email ({e}), продолжаю без этого")
+
+    @staticmethod
+    def _describe_pipeline_error(e: Exception) -> str:
+        """Превращает технические ошибки Telethon в короткое понятное
+        сообщение вместо тонны сырых байт в чате."""
+        text = str(e)
+        low = text.lower()
+        if "not registered" in low or "authkeyunregistered" in low:
+            return (
+                "мёртвая/невалидная сессия от продавца — аккаунт уже не "
+                "авторизован по этим HEX/DC (возможно, продавец сам сбросил "
+                "сессии после продажи). Пропускаю этот аккаунт."
+            )
+        if "constructor id" in low or "typenotfound" in low:
+            return (
+                "повреждённый ответ от Telegram при чтении данных аккаунта "
+                "(похоже на нерабочую/битую сессию от продавца). "
+                "Пропускаю этот аккаунт."
+            )
+        return text[:500]
 
     async def _buy_and_process(self, item_id: int, price: float, item: dict):
         await self.send_log(f"🛒 Покупаю лот #{item_id} за {price}₽...")
@@ -189,9 +210,8 @@ class Worker:
             cleanup_report = await cleanup_account(bought_client)
             await db.update_purchase_status(item_id, "cleaned")
             await self.send_log(
-                f"🧹 #{item_id}: удалено диалогов — {cleanup_report['deleted']}, "
-                f"не удалось — {cleanup_report['failed']}"
-                + (f"\nПричины: {cleanup_report['errors'][:5]}" if cleanup_report["errors"] else "")
+                f"🧹 #{item_id}: удалено {cleanup_report['deleted']}, "
+                f"не удалось {cleanup_report['failed']}"
             )
 
             # 3) Теперь создаём НОВУЮ сессию (код читаем из чата 777000 на
