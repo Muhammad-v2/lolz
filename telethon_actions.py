@@ -87,11 +87,41 @@ def _normalize_phone(phone: str | None) -> str:
     return p
 
 
-async def connect_from_hex_dc(hex_key: str, dc_id: int) -> TelegramClient:
-    dc_id = int(dc_id)
+async def _resolve_dc_address(dc_id: int) -> tuple[str, int]:
+    """
+    Спрашивает у самого Telegram актуальный адрес нужного дата-центра,
+    вместо того чтобы полагаться на зашитый в код список IP — те могут
+    устареть, из-за чего сервер не узнаёт auth_key ("key is not
+    registered"), хотя сам ключ на самом деле рабочий.
+    Если спросить не удалось — используем запасной захардкоженный список.
+    """
+    bootstrap = TelegramClient(MemorySession(), API_ID, API_HASH)
+    try:
+        await bootstrap.connect()
+        from telethon.tl.functions.help import GetConfigRequest
+        config = await bootstrap(GetConfigRequest())
+        candidates = [
+            o for o in config.dc_options
+            if o.id == dc_id and not o.ipv6 and not o.media_only and not o.tcpo_only
+        ]
+        if not candidates:
+            candidates = [o for o in config.dc_options if o.id == dc_id and not o.ipv6]
+        if candidates:
+            return candidates[0].ip_address, candidates[0].port
+    except Exception as e:
+        log.warning("Не удалось получить актуальный адрес DC%s: %s", dc_id, e)
+    finally:
+        await bootstrap.disconnect()
+
     ip = DC_ADDRESSES.get(dc_id)
     if not ip:
         raise AccountPipelineError(f"Неизвестный DC ID: {dc_id}")
+    return ip, 443
+
+
+async def connect_from_hex_dc(hex_key: str, dc_id: int) -> TelegramClient:
+    dc_id = int(dc_id)
+    ip, port = await _resolve_dc_address(dc_id)
 
     h = _normalize_hex(hex_key)
     try:
@@ -100,11 +130,11 @@ async def connect_from_hex_dc(hex_key: str, dc_id: int) -> TelegramClient:
         raise AccountPipelineError(f"Не удалось разобрать HEX: {e}") from e
 
     session = MemorySession()
-    session.set_dc(dc_id, ip, 443)
+    session.set_dc(dc_id, ip, port)
     session.auth_key = AuthKey(data=key_bytes)
 
     client = TelegramClient(session, API_ID, API_HASH)
-    client.session.set_dc(dc_id, ip, 443)
+    client.session.set_dc(dc_id, ip, port)
 
     try:
         await client.connect()
