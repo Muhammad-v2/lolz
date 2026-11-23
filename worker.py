@@ -1,10 +1,11 @@
 """
-Фоновый цикл: поиск → покупка → перелогин → чистка → продажа.
+Фоновый цикл: поиск → покупка → email → новая сессия → чистка → продажа.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 from lolz_client import LolzClient, LolzError
 from telethon_actions import (
@@ -23,7 +24,6 @@ from telethon_actions import (
 from email_client import wait_for_email_code
 from config import EMAIL_ADDRESS
 import db
-import time
 
 log = logging.getLogger("worker")
 
@@ -57,7 +57,6 @@ class Worker:
         remaining = await db.get_queue()
         if remaining <= 0:
             return
-
         price_min = float(await db.get_setting("buy_min_price"))
         price_max = float(await db.get_setting("buy_max_price"))
         spam = await db.get_setting("filter_spam")
@@ -66,35 +65,27 @@ class Worker:
         session_age_period = await db.get_setting("session_age_period")
 
         items = await self.lolz.search_telegram_accounts(
-            price_min,
-            price_max,
-            spam=spam,
-            password=password,
+            price_min, price_max, spam=spam, password=password,
             session_age_value=session_age_value,
             session_age_period=session_age_period,
         )
         if not items:
             return
-
-        # Пробуем несколько лотов из текущего поиска подряд, если верхний
-        # уже перехватили другие покупатели — чтобы не ждать целый
-        # интервал поиска заново ради одной неудачной попытки.
         for item in items[:5]:
             item_id = item.get("item_id") or item.get("itemId") or item.get("id")
             if item_id is None:
                 continue
             item_id = int(item_id)
             price = float(item.get("price", price_max))
-
             try:
                 await self._buy_and_process(item_id, price, item)
-                return  # успех — на этом тике больше ничего не делаем
+                return
             except LolzError as e:
                 msg = str(e)
                 low = msg.lower()
                 if "продан" in low or "sold" in low or "already" in low or "недоступен" in low:
                     await self.send_log(f"ℹ️ Лот #{item_id} уже купили раньше нас, пробую следующий")
-                    continue  # пробуем следующий лот из этого же поиска, сразу
+                    continue
                 log.exception("Ошибка обработки лота %s", item_id)
                 try:
                     await db.update_purchase_status(item_id, "error", msg)
@@ -112,51 +103,38 @@ class Worker:
                 await self.send_log(f"❌ Ошибка обработки аккаунта #{item_id}: {err_text}")
                 return
 
-    async def _attach_email(self, item_id: int, client):
-        """Привязывает EMAIL_ADDRESS как email для входа на аккаунте.
-        Код подтверждения Telegram пришлёт на эту почту — читаем его
-        сами через IMAP (email_client.py), без участия человека.
-        Если что-то не получится — пропускаем этот шаг, не ломая
-        остальной пайплайн (аккаунт всё равно выставится на продажу)."""
+    async def _attach_email(self, item_id: int, client) -> bool:
+        """Возвращает True, если email успешно привязан."""
         try:
             await self.send_log(f"✉️ #{item_id}: привязываю email {EMAIL_ADDRESS}...")
             request_time = time.time()
             await request_email_change(client, EMAIL_ADDRESS)
-
             code = await wait_for_email_code(after_ts=request_time, timeout=90)
             if not code:
-                await self.send_log(
-                    f"⚠️ #{item_id}: код подтверждения email не пришёл за 90 сек, "
-                    f"пропускаю привязку почты."
-                )
-                return
-
+                await self.send_log(f"⚠️ #{item_id}: код подтверждения email не пришёл за 90 сек.")
+                return False
             await confirm_email_change(client, code)
             await self.send_log(f"✅ #{item_id}: email успешно привязан")
+            return True
         except EmailChangeError as e:
-            await self.send_log(f"⚠️ #{item_id}: не удалось привязать email ({e}), продолжаю без этого")
+            await self.send_log(f"⚠️ #{item_id}: не удалось привязать email ({e})")
+            return False
         except Exception as e:
             log.exception("Ошибка привязки email для %s", item_id)
-            await self.send_log(f"⚠️ #{item_id}: ошибка при привязке email ({e}), продолжаю без этого")
+            await self.send_log(f"⚠️ #{item_id}: ошибка при привязке email ({e})")
+            return False
 
     @staticmethod
     def _describe_pipeline_error(e: Exception) -> str:
-        """Превращает технические ошибки Telethon в короткое понятное
-        сообщение вместо тонны сырых байт в чате."""
         text = str(e)
         low = text.lower()
         if "not registered" in low or "authkeyunregistered" in low:
-            return (
-                "мёртвая/невалидная сессия от продавца — аккаунт уже не "
-                "авторизован по этим HEX/DC (возможно, продавец сам сбросил "
-                "сессии после продажи). Пропускаю этот аккаунт."
-            )
+            return ("мёртвая/невалидная сессия от продавца — аккаунт уже не "
+                    "авторизован по этим HEX/DC. Пропускаю этот аккаунт.")
         if "constructor id" in low or "typenotfound" in low:
-            return (
-                "повреждённый ответ от Telegram при чтении данных аккаунта "
-                "(похоже на нерабочую/битую сессию от продавца). "
-                "Пропускаю этот аккаунт."
-            )
+            return ("повреждённый ответ от Telegram при чтении данных аккаунта "
+                    "(похоже на нерабочую/битую сессию от продавца). "
+                    "Пропускаю этот аккаунт.")
         return text[:500]
 
     async def _buy_and_process(self, item_id: int, price: float, item: dict):
@@ -166,7 +144,6 @@ class Worker:
         await db.add_spent(price)
 
         data = await self.lolz.get_item_login_data(item_id)
-
         hex_key_bought, dc_id_bought = LolzClient.extract_hex_dc(data)
         phone, country, country_code = LolzClient.extract_phone_country(data)
 
@@ -189,39 +166,28 @@ class Worker:
         if not hex_key_bought or not dc_id_bought:
             await db.update_purchase_status(item_id, "error", "Нет HEX/DC от Lolz")
             raw = str(data)[:3500]
-            await self.send_log(
-                f"❌ #{item_id}: не получены HEX/DC, остановлен.\nСырой ответ:\n{raw}"
-            )
+            await self.send_log(f"❌ #{item_id}: не получены HEX/DC, остановлен.\nСырой ответ:\n{raw}")
             raise AccountPipelineError("Нет HEX/DC от Lolz")
 
         bought_client = await connect_from_hex_dc(hex_key_bought, int(dc_id_bought))
         new_client = None
         try:
-            # 1) Сначала завершаем ВСЕ чужие сессии — возможно только потому,
-            #    что купленной сессии уже больше 24 часов.
-            await self.send_log(f"🔒 #{item_id}: завершаю чужие сессии...")
-            await terminate_other_sessions(bought_client)
-            await db.update_purchase_status(item_id, "sessions_terminated")
+            # 1) СНАЧАЛА привязываем email — пока сессия точно жива.
+            email_ok = False
+            if EMAIL_ADDRESS:
+                email_ok = await self._attach_email(item_id, bought_client)
 
-            # 2) Чистим чаты/контакты ПРЯМО на купленной сессии (новой пока
-            #    нет) — раньше чистка шла уже после перелогина, но суть та
-            #    же: чистим один раз, пока сессия одна и точно единственная.
-            await self.send_log(f"🧹 #{item_id}: чищу чаты, группы, каналы и контакты...")
-            cleanup_report = await cleanup_account(bought_client)
-            await db.update_purchase_status(item_id, "cleaned")
-            await self.send_log(
-                f"🧹 #{item_id}: удалено {cleanup_report['deleted']}, "
-                f"не удалось {cleanup_report['failed']}"
-            )
+            # 2) Пробуем получить код через Lolz API (если метод есть).
+            lolz_code = await self.lolz.get_login_code(item_id)
+            if lolz_code:
+                await self.send_log(f"🔑 #{item_id}: код получен через Lolz API")
 
-            # 3) Теперь создаём НОВУЮ сессию (код читаем из чата 777000 на
-            #    купленной сессии, которая пока ещё жива).
-            await self.send_log(f"🆕 #{item_id}: создаю новую сессию (жду код в 777000)...")
+            # 3) Создаём новую сессию (код из 777000 или Lolz API).
+            await self.send_log(f"🆕 #{item_id}: создаю новую сессию...")
             try:
                 new_client = await create_new_session(
-                    bought_client,
-                    phone,
-                    password=cloud_password,
+                    bought_client, phone, password=cloud_password,
+                    preloaded_code=lolz_code,
                 )
             except AccountPipelineError as e:
                 await db.update_purchase_status(item_id, "error", str(e))
@@ -229,39 +195,48 @@ class Worker:
                     f"❌ #{item_id}: не удалось создать новую сессию ({e}). "
                     f"Купленная сессия НЕ завершена — доступ не потерян."
                 )
+                if email_ok:
+                    await self.send_log(
+                        f"ℹ️ #{item_id}: но email привязан — можно продать с текущим HEX/DC."
+                    )
                 raise
 
             hex_key, dc_id = await get_auth_hex_and_dc(new_client)
 
-            # Сохраняем HEX/DC новой сессии СРАЗУ, до попытки продажи —
-            # если выставление на продажу упадёт, доступ всё равно не
-            # потеряется (и купленная сессия ещё жива, см. ниже).
             await db.set_purchase_extra(
-                item_id,
-                hex_key=hex_key,
-                dc_id=dc_id,
+                item_id, hex_key=hex_key, dc_id=dc_id,
                 buy_url=f"https://lzt.market/{item_id}/",
                 telegram_user_id=str(data.get("telegram_id") or data.get("telegramId") or ""),
             )
 
+            # 4) Теперь можно убить чужие сессии (у нас уже есть новая).
+            await self.send_log(f"🔒 #{item_id}: завершаю чужие сессии...")
+            await terminate_other_sessions(bought_client)
+            await db.update_purchase_status(item_id, "sessions_terminated")
+
+            # 5) Чистим купленную сессию.
+            await self.send_log(f"🧹 #{item_id}: чищу чаты и контакты...")
+            cleanup_report = await cleanup_account(bought_client)
+            await db.update_purchase_status(item_id, "cleaned")
+            await self.send_log(
+                f"🧹 #{item_id}: удалено {cleanup_report['deleted']}, "
+                f"не удалось {cleanup_report['failed']}"
+            )
+
+            # 6) Проверка спам-блока.
             check_spam = (await db.get_setting("check_spam_block")) != "0"
             if check_spam:
-                await self.send_log(f"🔍 #{item_id}: проверяю спам-блок через @SpamBot...")
+                await self.send_log(f"🔍 #{item_id}: проверяю спам-блок...")
                 spam_status = await check_spam_block(new_client)
                 await db.set_purchase_extra(item_id, spam_status=spam_status)
             else:
                 spam_status = "unknown"
 
-            if EMAIL_ADDRESS:
-                await self._attach_email(item_id, new_client)
-
+            # 7) Выставляем на продажу.
             sell_price = float(await db.get_setting("sell_price"))
             title_tpl = await db.get_setting("title_template")
             try:
-                title = title_tpl.format(
-                    code=country_code or "?",
-                    country=country or "—",
-                )
+                title = title_tpl.format(code=country_code or "?", country=country or "—")
             except Exception:
                 title = f"{country_code or '?'} {country or '—'} | Чистый | Не трогал"
 
@@ -270,80 +245,54 @@ class Worker:
             information = f"{after_purchase_note}\n{buyer_note}".strip()
 
             await self.send_log(f"📤 #{item_id}: выставляю на продажу за {sell_price}₽...")
-
             sell_result = None
             last_error = None
             for attempt in range(1, 4):
                 try:
                     sell_result = await self.lolz.list_for_sale(
-                        title=title,
-                        price=sell_price,
-                        description="",
-                        information=information,
-                        hex_key=hex_key,
-                        dc_id=dc_id,
+                        title=title, price=sell_price, description="",
+                        information=information, hex_key=hex_key, dc_id=dc_id,
                     )
                     last_error = None
                     break
                 except LolzError as e:
                     last_error = e
                     if "503" in str(e) or "502" in str(e) or "504" in str(e):
-                        # временная ошибка сервера Lolz — пробуем ещё раз
                         await asyncio.sleep(5 * attempt)
                         continue
                     raise
 
             if sell_result is None:
-                # Продажа не удалась даже после повторов. Купленную сессию
-                # НЕ завершаем — обе сессии (купленная и новая) остаются
-                # живыми, доступ не теряется, можно повторить вручную.
                 await db.update_purchase_status(item_id, "cleaned_not_listed", str(last_error))
                 await self.send_log(
-                    f"⚠️ #{item_id}: аккаунт готов (HEX/DC сохранены, купленная сессия "
-                    f"НЕ завершена), выставить на продажу не удалось: {last_error}\n"
-                    f"Можно повторить через кнопку «🔁 Повторить выставление» в карточке "
-                    f"аккаунта, в разделе «⚠️ Проблемные»."
+                    f"⚠️ #{item_id}: аккаунт готов, но выставить не удалось: {last_error}\n"
+                    f"Можно повторить вручную."
                 )
                 return
 
-            # Продажа прошла успешно — ТОЛЬКО ТЕПЕРЬ завершаем купленную
-            # сессию, раз новая сессия точно работает и аккаунт выставлен.
-            await self.send_log(f"🚪 #{item_id}: всё готово, завершаю купленную сессию...")
+            await self.send_log(f"🚪 #{item_id}: завершаю купленную сессию...")
             try:
                 await terminate_this_session(bought_client)
             except Exception as e:
-                await self.send_log(f"⚠️ #{item_id}: не удалось завершить купленную сессию ({e}), не критично")
+                await self.send_log(f"⚠️ #{item_id}: не удалось завершить купленную сессию ({e})")
             bought_client = None
-
             await db.update_purchase_status(item_id, "listed")
 
-            # id нового выставленного лота может называться по-разному —
-            # пробуем несколько вариантов, как и для других полей API.
             sell_item_id = None
             for key in ("item_id", "itemId", "id"):
                 val = sell_result.get(key) if isinstance(sell_result, dict) else None
                 if val:
                     sell_item_id = int(val)
                     break
-            if sell_item_id is None and isinstance(sell_result, dict):
-                nested = sell_result.get("item")
-                if isinstance(nested, dict):
-                    sell_item_id = nested.get("item_id") or nested.get("itemId")
-                    if sell_item_id:
-                        sell_item_id = int(sell_item_id)
 
             await db.set_purchase_extra(
-                item_id,
-                sell_item_id=sell_item_id,
-                sell_price=sell_price,
+                item_id, sell_item_id=sell_item_id, sell_price=sell_price,
                 buy_url=f"https://lzt.market/{item_id}/",
                 sell_url=f"https://lzt.market/{sell_item_id}/" if sell_item_id else None,
-                hex_key=hex_key,
-                dc_id=dc_id,
+                hex_key=hex_key, dc_id=dc_id,
                 telegram_user_id=str(data.get("telegram_id") or data.get("telegramId") or ""),
                 spam_status=spam_status,
             )
-
             await self.send_log(
                 f"💰 Аккаунт #{item_id} выставлен на продажу за {sell_price}₽:\n{title}"
             )
