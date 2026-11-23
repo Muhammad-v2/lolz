@@ -3,8 +3,8 @@
 
 Пайплайн:
   1) подключиться по HEX+DC
-  2) завершить все чужие сессии (кроме текущей купленной)
-  3) создать НОВУЮ сессию (код читаем из чата 777000 на купленной)
+  2) создать НОВУЮ сессию (код читаем из чата 777000 на купленной)
+  3) завершить все чужие сессии (кроме текущей купленной)
   4) забрать HEX+DC новой сессии
   5) завершить купленную сессию
   6) почистить чаты/контакты на новой (оставить только 777000)
@@ -28,8 +28,16 @@ from telethon.tl.functions.auth import LogOutRequest, ResetAuthorizationsRequest
 from telethon.tl.functions.contacts import DeleteContactsRequest, GetContactsRequest
 from telethon.tl.functions.channels import LeaveChannelRequest
 from telethon.tl.functions.messages import DeleteHistoryRequest
-from telethon.tl.functions.account import SendVerifyEmailCodeRequest, VerifyEmailRequest
-from telethon.tl.types import EmailVerifyPurposeLoginChange, EmailVerificationCode
+from telethon.tl.functions.account import (
+    SendVerifyEmailCodeRequest,
+    VerifyEmailRequest,
+    GetPasswordRequest,
+)
+from telethon.tl.types import (
+    EmailVerifyPurposeLoginChange,
+    EmailVerifyPurposeLoginSetup,
+    EmailVerificationCode,
+)
 
 from config import API_ID, API_HASH
 
@@ -245,6 +253,7 @@ async def create_new_session(
     request_time = datetime.now(timezone.utc)
     try:
         sent = await new_client.send_code_request(phone)
+        log.info("Тип отправки кода: %s", type(sent.type).__name__)
     except FloodWaitError as e:
         await new_client.disconnect()
         raise AccountPipelineError(
@@ -307,7 +316,7 @@ async def get_auth_hex_and_dc(client: TelegramClient) -> tuple[str, int]:
         raise AccountPipelineError("У сессии нет auth_key")
     hex_key = auth_key.key.hex()
     dc_id = int(client.session.dc_id)
-    if dc_id not in DC_ADDRESSES:
+    if not (1 <= dc_id <= 5):
         raise AccountPipelineError(f"Странный dc_id у новой сессии: {dc_id}")
     return hex_key, dc_id
 
@@ -332,9 +341,6 @@ async def cleanup_account(client: TelegramClient) -> dict:
     """
     report = {"deleted": 0, "failed": 0, "errors": []}
 
-    # Сразу после входа новой/купленной сессии список диалогов может быть ещё
-    # не до конца синхронизирован Telegram'ом — явно запрашиваем полный список
-    # перед тем, как начинать удалять, иначе iter_dialogs() может вернуть пусто.
     try:
         await client.get_dialogs(limit=200)
     except Exception as e:
@@ -352,14 +358,10 @@ async def cleanup_account(client: TelegramClient) -> dict:
 
     for dialog in dialogs:
         try:
-            # Сначала выходим из группы/канала (если это группа/канал и мы
-            # не просто собеседник), потом удаляем сам диалог с историей.
             if dialog.is_channel or dialog.is_group:
                 try:
                     await client(LeaveChannelRequest(dialog.entity))
                 except Exception as e:
-                    # не падаем — иногда leave и не нужен (уже не участник),
-                    # но delete_dialog ниже всё равно должен сработать
                     log.info("Leave не удался для %s (%s): %s", dialog.id, dialog.name, e)
 
             await client.delete_dialog(dialog.entity, revoke=True)
@@ -384,6 +386,7 @@ async def cleanup_account(client: TelegramClient) -> dict:
     log.info("Очистка аккаунта: удалено %s, не удалось %s", report["deleted"], report["failed"])
     return report
 
+
 # ---------- Проверка спам-блока через официального @SpamBot ----------
 
 SPAMBOT_USERNAME = "SpamBot"
@@ -395,7 +398,6 @@ async def check_spam_block(client: TelegramClient, timeout: int = 20) -> str:
     есть ли на аккаунте ограничения (спам-блок). Возвращает короткую
     метку: 'free' (ограничений нет), 'limited' (есть ограничения) или
     'unknown' (не удалось проверить — например, SpamBot не ответил).
-    Используется вместо того, чтобы верить заявлению продавца.
     """
     try:
         bot_entity = await client.get_entity(SPAMBOT_USERNAME)
@@ -423,11 +425,9 @@ async def check_spam_block(client: TelegramClient, timeout: int = 20) -> str:
                 text = (msg.text or "").lower()
                 if not text:
                     continue
-                # SpamBot отвечает по-разному в зависимости от языка аккаунта,
-                # поэтому проверяем по ключевым словам на нескольких языках.
                 if any(p in text for p in (
                     "good news", "no limits", "не ограничен",
-                    "хороших новостей", "ограничени", "свободен",
+                    "хороших новостей", "свободен",
                 )) and not any(p in text for p in (
                     "temporary", "limited", "ограничен", "restrict",
                 )):
@@ -451,23 +451,54 @@ class EmailChangeError(Exception):
 
 
 async def request_email_change(client: TelegramClient, new_email: str):
-    """Запрашивает привязку нового email для входа — Telegram пришлёт
-    код подтверждения на этот email (его дальше читает email_client.py)."""
+    """
+    Запрашивает привязку email. Автоматически выбирает:
+      - LoginSetup  — если email на аккаунте ещё НЕ настроен (EMAIL_NOT_SETUP)
+      - LoginChange — если email уже есть, меняем на новый
+    """
+    purpose = EmailVerifyPurposeLoginSetup()
+    try:
+        pwd = await client(GetPasswordRequest())
+        has_email = bool(
+            getattr(pwd, "email_unconfirmed_pattern", None)
+            or getattr(pwd, "login_email_pattern", None)
+        )
+        if has_email:
+            purpose = EmailVerifyPurposeLoginChange()
+    except Exception as e:
+        log.warning("Не удалось узнать состояние email: %s — пробую LoginSetup", e)
+
     try:
         await client(SendVerifyEmailCodeRequest(
-            purpose=EmailVerifyPurposeLoginChange(),
+            purpose=purpose,
             email=new_email,
         ))
+        log.info("Запрошена привязка email (%s)", type(purpose).__name__)
     except Exception as e:
+        # Если LoginChange не сработал — пробуем LoginSetup
+        if isinstance(purpose, EmailVerifyPurposeLoginChange):
+            try:
+                await client(SendVerifyEmailCodeRequest(
+                    purpose=EmailVerifyPurposeLoginSetup(),
+                    email=new_email,
+                ))
+                log.info("Запрошена привязка email (LoginSetup, fallback)")
+                return
+            except Exception as e2:
+                raise EmailChangeError(f"Не удалось запросить смену email: {e2}") from e2
         raise EmailChangeError(f"Не удалось запросить смену email: {e}") from e
 
 
 async def confirm_email_change(client: TelegramClient, code: str):
-    """Подтверждает смену email кодом, пришедшим на почту."""
-    try:
-        await client(VerifyEmailRequest(
-            purpose=EmailVerifyPurposeLoginChange(),
-            verification=EmailVerificationCode(code=code),
-        ))
-    except Exception as e:
-        raise EmailChangeError(f"Не удалось подтвердить email: {e}") from e
+    """Подтверждает email кодом, пришедшим на почту."""
+    for purpose in (EmailVerifyPurposeLoginSetup(), EmailVerifyPurposeLoginChange()):
+        try:
+            await client(VerifyEmailRequest(
+                purpose=purpose,
+                verification=EmailVerificationCode(code=code),
+            ))
+            log.info("Email подтверждён (%s)", type(purpose).__name__)
+            return
+        except Exception as e:
+            log.warning("Не удалось подтвердить email (%s): %s", type(purpose).__name__, e)
+    raise EmailChangeError("Не удалось подтвердить email ни через LoginSetup, ни через LoginChange")
