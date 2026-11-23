@@ -3,11 +3,12 @@
 
 Пайплайн:
   1) подключиться по HEX+DC
-  2) создать НОВУЮ сессию (код читаем из чата 777000 на купленной)
-  3) завершить все чужие сессии (кроме текущей купленной)
-  4) забрать HEX+DC новой сессии
-  5) завершить купленную сессию
-  6) почистить чаты/контакты на новой (оставить только 777000)
+  2) привязать email (LoginSetup / LoginChange)
+  3) создать НОВУЮ сессию (код из 777000 ИЛИ preloaded_code из Lolz API)
+  4) завершить все чужие сессии (кроме текущей купленной)
+  5) забрать HEX+DC новой сессии
+  6) завершить купленную сессию
+  7) почистить чаты/контакты на новой (оставить только 777000)
 """
 from __future__ import annotations
 
@@ -98,9 +99,7 @@ def _normalize_phone(phone: str | None) -> str:
 async def _resolve_dc_address(dc_id: int) -> tuple[str, int]:
     """
     Спрашивает у самого Telegram актуальный адрес нужного дата-центра,
-    вместо того чтобы полагаться на зашитый в код список IP — те могут
-    устареть, из-за чего сервер не узнаёт auth_key ("key is not
-    registered"), хотя сам ключ на самом деле рабочий.
+    вместо того чтобы полагаться на зашитый в код список IP.
     Если спросить не удалось — используем запасной захардкоженный список.
     """
     bootstrap = TelegramClient(MemorySession(), API_ID, API_HASH)
@@ -245,7 +244,13 @@ async def create_new_session(
     client_for_code_receiving: TelegramClient,
     phone: str,
     password: str | None = None,
+    preloaded_code: str | None = None,
 ) -> TelegramClient:
+    """
+    Создаёт новую сессию.
+    Если preloaded_code задан (например, код получен через Lolz API) —
+    сразу использует его и НЕ ждёт 777000.
+    """
     phone = _normalize_phone(phone)
     new_client = TelegramClient(MemorySession(), API_ID, API_HASH)
     await new_client.connect()
@@ -265,14 +270,17 @@ async def create_new_session(
 
     log.info("Код запрошен для %s", phone)
 
-    code = await _wait_for_code(client_for_code_receiving, after=request_time, timeout=120)
-    if not code:
-        await new_client.disconnect()
-        raise AccountPipelineError(
-            "Код входа не пришёл в чат 777000 за 120 секунд"
-        )
-
-    log.info("Код получен")
+    if preloaded_code:
+        code = preloaded_code
+        log.info("Использую preloaded_code из Lolz API")
+    else:
+        code = await _wait_for_code(client_for_code_receiving, after=request_time, timeout=120)
+        if not code:
+            await new_client.disconnect()
+            raise AccountPipelineError(
+                "Код входа не пришёл в чат 777000 за 120 секунд"
+            )
+        log.info("Код получен из 777000")
 
     try:
         await new_client.sign_in(
@@ -336,8 +344,7 @@ async def terminate_this_session(client: TelegramClient) -> None:
 async def cleanup_account(client: TelegramClient) -> dict:
     """
     Удаляет ВСЕ чаты/группы/каналы, кроме служебного чата Telegram (777000),
-    и чистит контакты. Возвращает отчёт {"deleted": N, "failed": N, "errors": [...]}
-    — чтобы было видно в логах бота, что реально произошло, а не "молча ничего".
+    и чистит контакты. Возвращает отчёт.
     """
     report = {"deleted": 0, "failed": 0, "errors": []}
 
@@ -394,10 +401,8 @@ SPAMBOT_USERNAME = "SpamBot"
 
 async def check_spam_block(client: TelegramClient, timeout: int = 20) -> str:
     """
-    Пишет официальному @SpamBot «/start» и разбирает ответ, чтобы узнать,
-    есть ли на аккаунте ограничения (спам-блок). Возвращает короткую
-    метку: 'free' (ограничений нет), 'limited' (есть ограничения) или
-    'unknown' (не удалось проверить — например, SpamBot не ответил).
+    Пишет официальному @SpamBot «/start» и разбирает ответ.
+    Возвращает 'free', 'limited' или 'unknown'.
     """
     try:
         bot_entity = await client.get_entity(SPAMBOT_USERNAME)
@@ -453,8 +458,8 @@ class EmailChangeError(Exception):
 async def request_email_change(client: TelegramClient, new_email: str):
     """
     Запрашивает привязку email. Автоматически выбирает:
-      - LoginSetup  — если email на аккаунте ещё НЕ настроен (EMAIL_NOT_SETUP)
-      - LoginChange — если email уже есть, меняем на новый
+      - LoginSetup  — если email ещё НЕ настроен (EMAIL_NOT_SETUP)
+      - LoginChange — если email уже есть
     """
     purpose = EmailVerifyPurposeLoginSetup()
     try:
@@ -475,7 +480,6 @@ async def request_email_change(client: TelegramClient, new_email: str):
         ))
         log.info("Запрошена привязка email (%s)", type(purpose).__name__)
     except Exception as e:
-        # Если LoginChange не сработал — пробуем LoginSetup
         if isinstance(purpose, EmailVerifyPurposeLoginChange):
             try:
                 await client(SendVerifyEmailCodeRequest(
@@ -501,4 +505,6 @@ async def confirm_email_change(client: TelegramClient, code: str):
             return
         except Exception as e:
             log.warning("Не удалось подтвердить email (%s): %s", type(purpose).__name__, e)
-    raise EmailChangeError("Не удалось подтвердить email ни через LoginSetup, ни через LoginChange")
+    raise EmailChangeError(
+        "Не удалось подтвердить email ни через LoginSetup, ни через LoginChange"
+    )
