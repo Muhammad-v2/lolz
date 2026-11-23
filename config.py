@@ -15,7 +15,16 @@ EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS", "")
 EMAIL_APP_PASSWORD = os.getenv("EMAIL_APP_PASSWORD", "")
 EMAIL_IMAP_SERVER = os.getenv("EMAIL_IMAP_SERVER", "imap.mail.ru")
 
-ALLOWED_ORIGINS = ["resale", "autoreg", "self_registration"]
+ALLOWED_ORIGINS = [
+    "resale",             # перепродажа
+    "autoreg",            # авторег
+    "self_registration",  # саморег
+    "personal",           # создан продавцом
+    "brute",              # брутфорс
+    "fishing",            # фишинг (именно так, не phishing)
+    "stealer",            # стиллер
+    "retrive",            # восстановлен (только VK)
+]
 
 DEFAULTS = {
     "check_spam_block": 1,
