@@ -11,31 +11,22 @@ API_HASH = os.getenv("API_HASH", "")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 SECRET_WORD = os.getenv("SECRET_WORD", "Зенит")
 
-# Почта, которую бот будет автоматически привязывать как email для входа
-# (альтернативный способ входа, НЕ 2FA-пароль) на каждом купленном
-# аккаунте. Если EMAIL_ADDRESS не задан — этот шаг просто пропускается.
 EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS", "")
 EMAIL_APP_PASSWORD = os.getenv("EMAIL_APP_PASSWORD", "")
 EMAIL_IMAP_SERVER = os.getenv("EMAIL_IMAP_SERVER", "imap.mail.ru")
 
-
-# Категории лотов на lzt.market, которые разрешено покупать.
-# Точные значения — из официальной документации Market API.
-# ВАЖНО: категории "stealer" (стиллер) и "phishing" (фишинг) никогда
-# не добавлять сюда — это угнанные у реальных людей аккаунты.
 ALLOWED_ORIGINS = ["resale", "autoreg", "self_registration"]
 
-# Значения по умолчанию — дальше их можно менять прямо в боте
 DEFAULTS = {
-    "check_spam_block": 1,  # 1 — проверять через @SpamBot (дольше), 0 — пропускать (быстрее)
+    "check_spam_block": 1,
     "buy_min_price": 5,
     "buy_max_price": 7,
     "sell_price": 11,
-    "search_interval_sec": 60,  # как часто искать новые лоты
-    "filter_spam": "nomatter",      # спам-блок: yes / no / nomatter
-    "filter_password": "no",        # облачный пароль: yes / no / nomatter
-    "session_age_value": 1,         # возраст сессии (число)
-    "session_age_period": "day",    # единица: day / month / year
+    "search_interval_sec": 60,
+    "filter_spam": "nomatter",
+    "filter_password": "no",
+    "session_age_value": 1,
+    "session_age_period": "day",
     "title_template": "+{code} {country} | Чистый | Не трогал",
     "sell_description": "После покупки меняйте почту и 2FA.",
     "sell_buyer_note": "Напишите отзыв.",
