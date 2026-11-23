@@ -16,14 +16,12 @@ EMAIL_APP_PASSWORD = os.getenv("EMAIL_APP_PASSWORD", "")
 EMAIL_IMAP_SERVER = os.getenv("EMAIL_IMAP_SERVER", "imap.mail.ru")
 
 ALLOWED_ORIGINS = [
-    "resale",             # перепродажа
-    "autoreg",            # авторег
-    "self_registration",  # саморег
-    "personal",           # создан продавцом
-    "brute",              # брутфорс
-    "fishing",            # фишинг (именно так, не phishing)
-    "stealer",            # стиллер
-    "retrive",            # восстановлен (только VK)
+    "resale",
+    "autoreg",
+    "self_registration",
+    "personal",
+    "dummy",
+    "retrieve_via_support",
 ]
 
 DEFAULTS = {
