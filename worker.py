@@ -1,5 +1,5 @@
 """
-Фоновый цикл: поиск → покупка → email → новая сессия → чистка → продажа.
+Фоновый цикл: поиск → покупка → новая сессия → email → чистка → продажа.
 """
 from __future__ import annotations
 
@@ -172,17 +172,14 @@ class Worker:
         bought_client = await connect_from_hex_dc(hex_key_bought, int(dc_id_bought))
         new_client = None
         try:
-            # 1) СНАЧАЛА привязываем email — пока сессия точно жива.
-            email_ok = False
-            if EMAIL_ADDRESS:
-                email_ok = await self._attach_email(item_id, bought_client)
-
-            # 2) Пробуем получить код через Lolz API (если метод есть).
+            # 1) Пробуем получить код через Lolz API (если метод есть).
             lolz_code = await self.lolz.get_login_code(item_id)
             if lolz_code:
                 await self.send_log(f"🔑 #{item_id}: код получен через Lolz API")
 
-            # 3) Создаём новую сессию (код из 777000 или Lolz API).
+            # 2) Создаём новую сессию (код из 777000 или Lolz API).
+            #    Именно здесь на new_client появляются _login_phone и _login_phone_code_hash,
+            #    которые нужны для EmailVerifyPurposeLoginSetup.
             await self.send_log(f"🆕 #{item_id}: создаю новую сессию...")
             try:
                 new_client = await create_new_session(
@@ -195,10 +192,6 @@ class Worker:
                     f"❌ #{item_id}: не удалось создать новую сессию ({e}). "
                     f"Купленная сессия НЕ завершена — доступ не потерян."
                 )
-                if email_ok:
-                    await self.send_log(
-                        f"ℹ️ #{item_id}: но email привязан — можно продать с текущим HEX/DC."
-                    )
                 raise
 
             hex_key, dc_id = await get_auth_hex_and_dc(new_client)
@@ -208,6 +201,11 @@ class Worker:
                 buy_url=f"https://lzt.market/{item_id}/",
                 telegram_user_id=str(data.get("telegram_id") or data.get("telegramId") or ""),
             )
+
+            # 3) Теперь привязываем email УЖЕ на новой сессии (есть данные LoginSetup)
+            email_ok = False
+            if EMAIL_ADDRESS:
+                email_ok = await self._attach_email(item_id, new_client)
 
             # 4) Теперь можно убить чужие сессии (у нас уже есть новая).
             await self.send_log(f"🔒 #{item_id}: завершаю чужие сессии...")
@@ -307,3 +305,8 @@ class Worker:
                     await bought_client.disconnect()
                 except Exception:
                     pass
+Просто скопируй всё содержимое блока выше → сохрани как worker.py → замени старый файл.
+
+
+
+
