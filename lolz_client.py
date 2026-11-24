@@ -183,13 +183,16 @@ class LolzClient:
         """
         for endpoint in (f"/{item_id}/telegram-login-code", f"/{item_id}/login-code"):
             try:
-                result = await self._market.general.request("GET", endpoint, dict)
-                if isinstance(result, dict):
-                    code = (result.get("code") or result.get("login_code")
-                            or result.get("telegram_code"))
-                    if code:
-                        log.info("Код получен через Lolz API: %s", endpoint)
-                        return str(code)
+                result = await self._market.general.request("GET", endpoint, StatusResponse)
+                data = result.model_dump()
+                extra = getattr(result, "model_extra", None)
+                if extra:
+                    data.update(extra)
+                code = data.get("code") or data.get("login_code") or data.get("telegram_code")
+                if code:
+                    log.info("Код получен через Lolz API: %s", endpoint)
+                    return str(code)
+                log.debug("Lolz API %s ответил, но без кода: %s", endpoint, data)
             except Exception as e:
                 log.debug("Lolz API %s не сработал: %s", endpoint, e)
         return None
