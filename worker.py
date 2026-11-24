@@ -305,7 +305,6 @@ class Worker:
                     await bought_client.disconnect()
                 except Exception:
                     pass
-Просто скопируй всё содержимое блока выше → сохрани как worker.py → замени старый файл.
 
 
 
