@@ -457,54 +457,32 @@ class EmailChangeError(Exception):
 
 async def request_email_change(client: TelegramClient, new_email: str):
     """
-    Запрашивает привязку email. Автоматически выбирает:
-      - LoginSetup  — если email ещё НЕ настроен (EMAIL_NOT_SETUP)
-      - LoginChange — если email уже есть
-    """
-    purpose = EmailVerifyPurposeLoginSetup()
-    try:
-        pwd = await client(GetPasswordRequest())
-        has_email = bool(
-            getattr(pwd, "email_unconfirmed_pattern", None)
-            or getattr(pwd, "login_email_pattern", None)
-        )
-        if has_email:
-            purpose = EmailVerifyPurposeLoginChange()
-    except Exception as e:
-        log.warning("Не удалось узнать состояние email: %s — пробую LoginSetup", e)
+    Запрашивает привязку email для входа.
 
+    ВАЖНО: LoginSetup предназначен ТОЛЬКО для смены email прямо во время
+    первого входа в аккаунт (ещё нет сессии, есть phone_number и
+    phone_code_hash от самого входа) — у него обязательные параметры,
+    без них он даже не создастся (упадёт с TypeError, не дойдя до сети).
+    У нас сессия уже есть (мы залогинены), поэтому всегда LoginChange —
+    единственный правильный вариант в этом сценарии.
+    """
     try:
         await client(SendVerifyEmailCodeRequest(
-            purpose=purpose,
+            purpose=EmailVerifyPurposeLoginChange(),
             email=new_email,
         ))
-        log.info("Запрошена привязка email (%s)", type(purpose).__name__)
+        log.info("Запрошена привязка email (LoginChange)")
     except Exception as e:
-        if isinstance(purpose, EmailVerifyPurposeLoginChange):
-            try:
-                await client(SendVerifyEmailCodeRequest(
-                    purpose=EmailVerifyPurposeLoginSetup(),
-                    email=new_email,
-                ))
-                log.info("Запрошена привязка email (LoginSetup, fallback)")
-                return
-            except Exception as e2:
-                raise EmailChangeError(f"Не удалось запросить смену email: {e2}") from e2
         raise EmailChangeError(f"Не удалось запросить смену email: {e}") from e
 
 
 async def confirm_email_change(client: TelegramClient, code: str):
     """Подтверждает email кодом, пришедшим на почту."""
-    for purpose in (EmailVerifyPurposeLoginSetup(), EmailVerifyPurposeLoginChange()):
-        try:
-            await client(VerifyEmailRequest(
-                purpose=purpose,
-                verification=EmailVerificationCode(code=code),
-            ))
-            log.info("Email подтверждён (%s)", type(purpose).__name__)
-            return
-        except Exception as e:
-            log.warning("Не удалось подтвердить email (%s): %s", type(purpose).__name__, e)
-    raise EmailChangeError(
-        "Не удалось подтвердить email ни через LoginSetup, ни через LoginChange"
-    )
+    try:
+        await client(VerifyEmailRequest(
+            purpose=EmailVerifyPurposeLoginChange(),
+            verification=EmailVerificationCode(code=code),
+        ))
+        log.info("Email подтверждён")
+    except Exception as e:
+        raise EmailChangeError(f"Не удалось подтвердить email: {e}") from e
