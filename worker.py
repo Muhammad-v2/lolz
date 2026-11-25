@@ -1,11 +1,10 @@
 """
-Фоновый цикл: поиск → покупка → новая сессия → email → чистка → продажа.
+Фоновый цикл: поиск → покупка → новая сессия → чистка → продажа.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
-import time
 
 from lolz_client import LolzClient, LolzError
 from telethon_actions import (
@@ -16,13 +15,8 @@ from telethon_actions import (
     terminate_this_session,
     cleanup_account,
     check_spam_block,
-    request_email_change,
-    confirm_email_change,
-    EmailChangeError,
     AccountPipelineError,
 )
-from email_client import wait_for_email_code
-from config import EMAIL_ADDRESS
 import db
 
 log = logging.getLogger("worker")
@@ -103,27 +97,6 @@ class Worker:
                 await self.send_log(f"❌ Ошибка обработки аккаунта #{item_id}: {err_text}")
                 return
 
-    async def _attach_email(self, item_id: int, client) -> bool:
-        """Возвращает True, если email успешно привязан."""
-        try:
-            await self.send_log(f"✉️ #{item_id}: привязываю email {EMAIL_ADDRESS}...")
-            request_time = time.time()
-            await request_email_change(client, EMAIL_ADDRESS)
-            code = await wait_for_email_code(after_ts=request_time, timeout=90)
-            if not code:
-                await self.send_log(f"⚠️ #{item_id}: код подтверждения email не пришёл за 90 сек.")
-                return False
-            await confirm_email_change(client, code)
-            await self.send_log(f"✅ #{item_id}: email успешно привязан")
-            return True
-        except EmailChangeError as e:
-            await self.send_log(f"⚠️ #{item_id}: не удалось привязать email ({e})")
-            return False
-        except Exception as e:
-            log.exception("Ошибка привязки email для %s", item_id)
-            await self.send_log(f"⚠️ #{item_id}: ошибка при привязке email ({e})")
-            return False
-
     @staticmethod
     def _describe_pipeline_error(e: Exception) -> str:
         text = str(e)
@@ -133,8 +106,8 @@ class Worker:
                     "авторизован по этим HEX/DC. Пропускаю этот аккаунт.")
         if "constructor id" in low or "typenotfound" in low:
             return ("повреждённый ответ от Telegram при чтении данных аккаунта "
-                    "(похоже на нерабочую/битую сессию от продавца). "
-                    "Пропускаю этот аккаунт.")
+                    "(похоже на нерабочую/битую сессию от продавца, либо устаревшую "
+                    "библиотеку Telethon). Пропускаю этот аккаунт.")
         return text[:500]
 
     async def _buy_and_process(self, item_id: int, price: float, item: dict):
@@ -172,14 +145,13 @@ class Worker:
         bought_client = await connect_from_hex_dc(hex_key_bought, int(dc_id_bought))
         new_client = None
         try:
-            # 1) Пробуем получить код через Lolz API (если метод есть).
+            # 1) Пробуем получить код для входа через API Lolz (кнопка
+            #    "получить код"), чтобы не читать историю купленной сессии.
             lolz_code = await self.lolz.get_login_code(item_id)
             if lolz_code:
                 await self.send_log(f"🔑 #{item_id}: код получен через Lolz API")
 
-            # 2) Создаём новую сессию (код из 777000 или Lolz API).
-            #    Именно здесь на new_client появляются _login_phone и _login_phone_code_hash,
-            #    которые нужны для EmailVerifyPurposeLoginSetup.
+            # 2) Создаём новую сессию.
             await self.send_log(f"🆕 #{item_id}: создаю новую сессию...")
             try:
                 new_client = await create_new_session(
@@ -202,17 +174,12 @@ class Worker:
                 telegram_user_id=str(data.get("telegram_id") or data.get("telegramId") or ""),
             )
 
-            # 3) Теперь привязываем email УЖЕ на новой сессии (есть данные LoginSetup)
-            email_ok = False
-            if EMAIL_ADDRESS:
-                email_ok = await self._attach_email(item_id, new_client)
-
-            # 4) Теперь можно убить чужие сессии (у нас уже есть новая).
+            # 3) Завершаем чужие сессии (новая уже есть).
             await self.send_log(f"🔒 #{item_id}: завершаю чужие сессии...")
             await terminate_other_sessions(bought_client)
             await db.update_purchase_status(item_id, "sessions_terminated")
 
-            # 5) Чистим купленную сессию.
+            # 4) Чистим купленную сессию.
             await self.send_log(f"🧹 #{item_id}: чищу чаты и контакты...")
             cleanup_report = await cleanup_account(bought_client)
             await db.update_purchase_status(item_id, "cleaned")
@@ -221,7 +188,7 @@ class Worker:
                 f"не удалось {cleanup_report['failed']}"
             )
 
-            # 6) Проверка спам-блока.
+            # 5) Проверка спам-блока.
             check_spam = (await db.get_setting("check_spam_block")) != "0"
             if check_spam:
                 await self.send_log(f"🔍 #{item_id}: проверяю спам-блок...")
@@ -230,7 +197,7 @@ class Worker:
             else:
                 spam_status = "unknown"
 
-            # 7) Выставляем на продажу.
+            # 6) Выставляем на продажу.
             sell_price = float(await db.get_setting("sell_price"))
             title_tpl = await db.get_setting("title_template")
             try:
@@ -305,7 +272,3 @@ class Worker:
                     await bought_client.disconnect()
                 except Exception:
                     pass
-
-
-
-
