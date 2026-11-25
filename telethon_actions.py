@@ -3,12 +3,11 @@
 
 Пайплайн:
   1) подключиться по HEX+DC
-  2) привязать email (LoginSetup / LoginChange)
-  3) создать НОВУЮ сессию (код из 777000 ИЛИ preloaded_code из Lolz API)
-  4) завершить все чужие сессии (кроме текущей купленной)
-  5) забрать HEX+DC новой сессии
-  6) завершить купленную сессию
-  7) почистить чаты/контакты на новой (оставить только 777000)
+  2) создать НОВУЮ сессию (код из 777000 ИЛИ preloaded_code из Lolz API)
+  3) завершить все чужие сессии (кроме текущей купленной)
+  4) забрать HEX+DC новой сессии
+  5) завершить купленную сессию
+  6) почистить чаты/контакты на новой (оставить только 777000)
 """
 from __future__ import annotations
 
@@ -29,16 +28,6 @@ from telethon.tl.functions.auth import LogOutRequest, ResetAuthorizationsRequest
 from telethon.tl.functions.contacts import DeleteContactsRequest, GetContactsRequest
 from telethon.tl.functions.channels import LeaveChannelRequest
 from telethon.tl.functions.messages import DeleteHistoryRequest
-from telethon.tl.functions.account import (
-    SendVerifyEmailCodeRequest,
-    VerifyEmailRequest,
-    GetPasswordRequest,
-)
-from telethon.tl.types import (
-    EmailVerifyPurposeLoginChange,
-    EmailVerifyPurposeLoginSetup,
-    EmailVerificationCode,
-)
 
 from config import API_ID, API_HASH
 
@@ -316,13 +305,6 @@ async def create_new_session(
     me = await new_client.get_me()
     log.info("Новая сессия OK: id=%s phone=%s", me.id, me.phone)
 
-    # Сохраняем для request_email_change: EmailVerifyPurposeLoginSetup
-    # (нужен для аккаунтов, где email для входа ещё НИ РАЗУ не настраивался —
-    # это почти все купленные аккаунты) требует именно эти phone_number
-    # и phone_code_hash от ТЕКУЩЕГО входа, а не что-то произвольное.
-    new_client._login_phone = phone
-    new_client._login_phone_code_hash = sent.phone_code_hash
-
     return new_client
 
 
@@ -456,80 +438,3 @@ async def check_spam_block(client: TelegramClient, timeout: int = 20) -> str:
 
     return "unknown"
 
-
-# ---------- Привязка email для входа (автоматически, через IMAP) ----------
-
-class EmailChangeError(Exception):
-    pass
-
-
-async def request_email_change(client: TelegramClient, new_email: str):
-    """
-    Запрашивает привязку email для входа.
-
-    LoginChange — для аккаунта, где email УЖЕ был настроен раньше (смена).
-    LoginSetup — для аккаунта, где email для входа ещё НИ РАЗУ не
-    настраивался (это почти все купленные аккаунты) — но ему обязательно
-    нужны phone_number и phone_code_hash от ТЕКУЩЕГО входа (их сохранил
-    create_new_session на самом объекте client).
-
-    Пробуем LoginSetup первым (это основной случай), и только если
-    получим ошибку "EMAIL_ALREADY_SETUP" — откатываемся на LoginChange.
-    """
-    phone = getattr(client, "_login_phone", None)
-    phone_code_hash = getattr(client, "_login_phone_code_hash", None)
-
-    if phone and phone_code_hash:
-        try:
-            await client(SendVerifyEmailCodeRequest(
-                purpose=EmailVerifyPurposeLoginSetup(
-                    phone_number=phone,
-                    phone_code_hash=phone_code_hash,
-                ),
-                email=new_email,
-            ))
-            log.info("Запрошена привязка email (LoginSetup)")
-            return
-        except Exception as e:
-            if "EMAIL_ALREADY_SETUP" not in str(e) and "EMAIL_SETUP" not in str(e):
-                raise EmailChangeError(f"Не удалось запросить смену email: {e}") from e
-            log.info("Email уже был настроен раньше, пробую LoginChange")
-
-    try:
-        await client(SendVerifyEmailCodeRequest(
-            purpose=EmailVerifyPurposeLoginChange(),
-            email=new_email,
-        ))
-        log.info("Запрошена привязка email (LoginChange)")
-    except Exception as e:
-        raise EmailChangeError(f"Не удалось запросить смену email: {e}") from e
-
-
-async def confirm_email_change(client: TelegramClient, code: str):
-    """Подтверждает email кодом, пришедшим на почту — тем же способом
-    (LoginSetup/LoginChange), каким его запрашивали в request_email_change."""
-    phone = getattr(client, "_login_phone", None)
-    phone_code_hash = getattr(client, "_login_phone_code_hash", None)
-
-    if phone and phone_code_hash:
-        try:
-            await client(VerifyEmailRequest(
-                purpose=EmailVerifyPurposeLoginSetup(
-                    phone_number=phone,
-                    phone_code_hash=phone_code_hash,
-                ),
-                verification=EmailVerificationCode(code=code),
-            ))
-            log.info("Email подтверждён (LoginSetup)")
-            return
-        except Exception as e:
-            log.warning("Подтверждение через LoginSetup не удалось (%s), пробую LoginChange", e)
-
-    try:
-        await client(VerifyEmailRequest(
-            purpose=EmailVerifyPurposeLoginChange(),
-            verification=EmailVerificationCode(code=code),
-        ))
-        log.info("Email подтверждён (LoginChange)")
-    except Exception as e:
-        raise EmailChangeError(f"Не удалось подтвердить email: {e}") from e
