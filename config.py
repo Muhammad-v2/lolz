@@ -11,10 +11,6 @@ API_HASH = os.getenv("API_HASH", "")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 SECRET_WORD = os.getenv("SECRET_WORD", "Зенит")
 
-EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS", "")
-EMAIL_APP_PASSWORD = os.getenv("EMAIL_APP_PASSWORD", "")
-EMAIL_IMAP_SERVER = os.getenv("EMAIL_IMAP_SERVER", "imap.mail.ru")
-
 ALLOWED_ORIGINS = [
     "resale",
     "autoreg",
