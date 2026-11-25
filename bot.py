@@ -9,11 +9,15 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
-    Message, ReplyKeyboardMarkup, KeyboardButton,
-    InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
 )
 
-from config import BOT_TOKEN, ADMIN_ID
+from config import ADMIN_ID, BOT_TOKEN
 import db
 from lolz_client import LolzClient, LolzError
 
@@ -33,8 +37,6 @@ def _get_lolz_client() -> LolzClient:
         _lolz_client = LolzClient()
     return _lolz_client
 
-
-# ---------- Клавиатура ----------
 
 MAIN_MENU = ReplyKeyboardMarkup(
     keyboard=[
@@ -74,8 +76,6 @@ CANCEL_KB = ReplyKeyboardMarkup(
 )
 
 
-# ---------- Состояния ожидания ввода ----------
-
 class Form(StatesGroup):
     edit_item_price = State()
     buy_count = State()
@@ -95,13 +95,12 @@ async def send_log(text: str):
         log.exception("Не удалось отправить сообщение админу")
 
 
-# ---------- Старт / отмена ----------
-
 @dp.message(Command("start", "help"))
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(
-        "Бот управления Lolz Market.\nВыбери действие на клавиатуре ниже 👇",
+        "Привет! Это бот автопокупки и перепродажи Telegram-аккаунтов на Lolz Market.\n"
+        "Выбирай действие кнопками ниже:",
         reply_markup=MAIN_MENU,
     )
 
@@ -112,82 +111,74 @@ async def cmd_cancel(message: Message, state: FSMContext):
     await message.answer("Отменено.", reply_markup=MAIN_MENU)
 
 
-# ---------- Статус ----------
-
 @dp.message(F.text == "📊 Статус")
-async def show_status(message: Message):
-    settings = await db.get_settings()
-    spent = await db.get_today_spent()
-    bought_today = await db.get_today_count()
-    remaining = await db.get_queue()
+async def cmd_status(message: Message):
+    s = await db.get_settings()
     enabled = await db.is_enabled()
-    purchases = await db.recent_purchases(5)
+    queue = await db.get_queue()
+    spent = await db.get_today_spent()
+    count = await db.get_today_count()
+    recent = await db.recent_purchases(5)
 
     try:
-        client = _get_lolz_client()
-        balance = await client.get_balance()
-        balance_line = f"Баланс на Lolz: {balance}₽"
+        balance = await _get_lolz_client().get_balance()
+        bal_str = f"{balance}₽"
     except LolzError as e:
-        balance_line = f"Баланс на Lolz: не удалось получить ({e})"
+        bal_str = f"ошибка ({e})"
 
     lines = [
-        f"Состояние: {'▶️ работает' if enabled else '⏸ на паузе'}",
-        balance_line,
-        f"Куплено сегодня: {bought_today} аккаунт(ов) на {spent}₽",
-        f"В очереди на покупку: {remaining}",
-        f"Цена покупки: {settings.get('buy_min_price')}–{settings.get('buy_max_price')}₽",
-        f"Цена продажи: {settings.get('sell_price')}₽",
-        f"Интервал поиска: {settings.get('search_interval_sec')} сек",
+        f"Состояние: {'▶️ Работает' if enabled else '⏸ На паузе'}",
+        f"Баланс Lolz: {bal_str}",
+        f"В очереди на покупку: {queue} шт.",
+        f"Куплено сегодня: {count} шт. на {spent:.2f}₽",
+        f"Цена покупки: {s['buy_min_price']}–{s['buy_max_price']}₽",
+        f"Цена продажи: {s['sell_price']}₽",
+        f"Интервал поиска: {s['search_interval_sec']} сек",
         "",
         "Последние покупки:",
     ]
-    if purchases:
-        for p in purchases:
-            lines.append(f"#{p['item_id']} {p['status']} ({p['price']}₽, {p['country']})")
+    if not recent:
+        lines.append("— пока нет")
     else:
-        lines.append("пока нет")
+        for p in recent:
+            lines.append(
+                f"#{p['item_id']} | {p['price']}₽ | {p['phone'] or '—'} | {p['status']}"
+            )
     await message.answer("\n".join(lines), reply_markup=MAIN_MENU)
 
 
-# ---------- Очередь покупок ----------
-
 @dp.message(F.text == "🛒 Очередь покупок")
-async def ask_buy_count(message: Message, state: FSMContext):
+async def ask_queue(message: Message, state: FSMContext):
     current = await db.get_queue()
     await state.set_state(Form.buy_count)
     await message.answer(
-        f"Сейчас в очереди: {current}\n\n"
-        f"Напиши число, чтобы ДОБАВИТЬ (например 3), "
-        f"или со знаком минус, чтобы УБАВИТЬ (например -2).\n"
-        f"Чтобы обнулить очередь — напиши 0=0",
+        f"Сейчас в очереди: {current} шт.\n"
+        "Напиши число:\n"
+        "• просто 5 — установить 5\n"
+        "• +3 или -2 — прибавить/убавить",
         reply_markup=CANCEL_KB,
     )
 
 
 @dp.message(StateFilter(Form.buy_count))
-async def set_buy_count(message: Message, state: FSMContext):
-    text = message.text.strip()
-    if text == "0=0":
-        await db.set_queue(0)
-        await state.clear()
-        await message.answer("Очередь обнулена ✅", reply_markup=MAIN_MENU)
+async def set_queue(message: Message, state: FSMContext):
+    txt = message.text.strip()
+    if txt.startswith(("+", "-")) and txt[1:].isdigit():
+        new_val = await db.add_queue(int(txt))
+    elif txt.isdigit():
+        await db.set_queue(int(txt))
+        new_val = int(txt)
+    else:
+        await message.answer("Нужно целое число (например 5, +2 или -1).")
         return
-    try:
-        n = int(text)
-    except ValueError:
-        await message.answer("Нужно число, например 3 или -2.")
-        return
-    new_total = await db.add_queue(n)
     await state.clear()
-    await message.answer(f"Теперь в очереди: {new_total} ✅", reply_markup=MAIN_MENU)
+    await message.answer(f"Очередь обновлена: {new_val} шт. ✅", reply_markup=MAIN_MENU)
 
-
-# ---------- Пауза / запуск рабочего цикла ----------
 
 @dp.message(F.text == "⏸ Пауза")
 async def pause_worker(message: Message):
     await db.set_enabled(False)
-    await message.answer("Поиск и покупка приостановлены ⏸ (бот сам работает, цикл стоит)", reply_markup=MAIN_MENU)
+    await message.answer("Поставил на паузу ⏸ (бот работает, цикл стоит)", reply_markup=MAIN_MENU)
 
 
 @dp.message(F.text == "▶️ Запустить")
@@ -196,8 +187,6 @@ async def resume_worker(message: Message):
     await message.answer("Поиск и покупка снова работают ▶️", reply_markup=MAIN_MENU)
 
 
-# ---------- Цена покупки ----------
-
 @dp.message(F.text == "📥 Цена покупки")
 async def ask_buy_price(message: Message, state: FSMContext):
     mn = await db.get_setting("buy_min_price")
@@ -205,7 +194,7 @@ async def ask_buy_price(message: Message, state: FSMContext):
     await state.set_state(Form.buy_price)
     await message.answer(
         f"Текущая цена покупки: {mn}–{mx}₽\n"
-        f"Напиши новый диапазон через пробел, например: 5 7",
+        "Напиши новый диапазон через пробел, например: 5 7",
         reply_markup=CANCEL_KB,
     )
 
@@ -213,7 +202,7 @@ async def ask_buy_price(message: Message, state: FSMContext):
 @dp.message(StateFilter(Form.buy_price))
 async def set_buy_price(message: Message, state: FSMContext):
     parts = message.text.split()
-    if len(parts) != 2 or not all(p.isdigit() for p in parts):
+    if len(parts) != 2 or not all(p.replace(".", "", 1).isdigit() for p in parts):
         await message.answer("Напиши два числа через пробел, например: 5 7")
         return
     await db.set_setting("buy_min_price", parts[0])
@@ -221,8 +210,6 @@ async def set_buy_price(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(f"Цена покупки: {parts[0]}–{parts[1]}₽ ✅", reply_markup=MAIN_MENU)
 
-
-# ---------- Цена продажи ----------
 
 @dp.message(F.text == "📤 Цена продажи")
 async def ask_sell_price(message: Message, state: FSMContext):
@@ -233,7 +220,7 @@ async def ask_sell_price(message: Message, state: FSMContext):
 
 @dp.message(StateFilter(Form.sell_price))
 async def set_sell_price(message: Message, state: FSMContext):
-    if not message.text.isdigit():
+    if not message.text.replace(".", "", 1).isdigit():
         await message.answer("Нужно число, например 11.")
         return
     await db.set_setting("sell_price", message.text)
@@ -241,16 +228,14 @@ async def set_sell_price(message: Message, state: FSMContext):
     await message.answer(f"Цена продажи: {message.text}₽ ✅", reply_markup=MAIN_MENU)
 
 
-# ---------- Шаблон заголовка ----------
-
 @dp.message(F.text == "📝 Шаблон заголовка")
 async def ask_title(message: Message, state: FSMContext):
     current = await db.get_setting("title_template")
     await state.set_state(Form.title_template)
     await message.answer(
         f"Текущий шаблон:\n{current}\n\n"
-        f"Напиши новый. Используй {{code}} для кода страны и {{country}} для названия.\n"
-        f"Пример: +{{code}} {{country}} | Чистый | Не трогал",
+        "Напиши новый. Используй {code} для кода страны и {country} для названия.\n"
+        "Пример: +{code} {country} | Чистый | Не трогал",
         reply_markup=CANCEL_KB,
     )
 
@@ -261,8 +246,6 @@ async def set_title(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("Шаблон заголовка обновлён ✅", reply_markup=MAIN_MENU)
 
-
-# ---------- Интервал поиска ----------
 
 @dp.message(F.text == "⏱ Интервал поиска")
 async def ask_interval(message: Message, state: FSMContext):
@@ -284,8 +267,6 @@ async def set_interval(message: Message, state: FSMContext):
     await message.answer(f"Интервал поиска: {message.text} сек ✅", reply_markup=MAIN_MENU)
 
 
-# ---------- Фильтры поиска (как на сайте lzt.market) ----------
-
 YES_NO_MAP = {"да": "yes", "нет": "no", "неважно": "nomatter"}
 YES_NO_LABEL = {"yes": "да", "no": "нет", "nomatter": "неважно"}
 
@@ -303,8 +284,7 @@ async def open_filters(message: Message, state: FSMContext):
         f"🔒 Пароль: {YES_NO_LABEL.get(password, password)}\n"
         f"⏳ Возраст сессии: больше {sess_v} {sess_p}\n"
         f"🔍 Проверка через SpamBot: {'включена (дольше, точнее)' if (await db.get_setting('check_spam_block')) != '0' else 'выключена (быстрее)'}\n\n"
-        f"Цена покупки настраивается отдельной кнопкой «📥 Цена покупки».\n\n"
-        f"Выбери, что изменить:",
+        "Выбери, что изменить:",
         reply_markup=FILTERS_MENU,
     )
 
@@ -316,8 +296,7 @@ async def toggle_spam_check(message: Message):
     await db.set_setting("check_spam_block", new_value)
     label = "включена" if new_value == "1" else "выключена"
     await message.answer(
-        f"Проверка спам-блока через @SpamBot теперь {label}.\n"
-        f"{'Обработка каждого аккаунта будет чуть дольше, зато точнее.' if new_value == '1' else 'Обработка будет быстрее, но статус спам-блока будет неизвестен.'}",
+        f"Проверка спам-блока через @SpamBot теперь {label}.",
         reply_markup=FILTERS_MENU,
     )
 
@@ -353,8 +332,7 @@ async def set_spam(message: Message, state: FSMContext):
 async def ask_password(message: Message, state: FSMContext):
     await state.set_state(Form.filter_password)
     await message.answer(
-        "Искать аккаунты с облачным паролем?\n"
-        "«Да» — только с паролем\n«Нет» — только без пароля\n«Неважно» — любые",
+        "Фильтр облачного пароля (2FA):",
         reply_markup=YES_NO_KB,
     )
 
@@ -372,66 +350,59 @@ async def set_password(message: Message, state: FSMContext):
 
 @dp.message(F.text == "⏳ Возраст сессии")
 async def ask_session_age(message: Message, state: FSMContext):
-    sess_v = await db.get_setting("session_age_value")
-    sess_p = await db.get_setting("session_age_period")
     await state.set_state(Form.session_age)
     await message.answer(
-        f"Текущее значение: больше {sess_v} {sess_p}\n\n"
-        f"Напиши новое значение в формате: число период\n"
-        f"Период может быть: day (дни), month (месяцы), year (годы)\n"
-        f"Пример: 1 day — сессия старше одного дня (~24 часа)",
+        "Напиши минимальный возраст сессии, например: 1 day, 12 hour, 7 day",
         reply_markup=CANCEL_KB,
     )
 
 
 @dp.message(StateFilter(Form.session_age))
 async def set_session_age(message: Message, state: FSMContext):
-    parts = message.text.split()
-    if len(parts) != 2 or not parts[0].isdigit() or parts[1] not in ("day", "month", "year"):
-        await message.answer("Формат: число период (day/month/year). Пример: 1 day")
+    parts = message.text.strip().lower().split()
+    if len(parts) != 2 or not parts[0].isdigit() or parts[1] not in ("hour", "day", "week", "month"):
+        await message.answer("Формат: <число> <hour|day|week|month>, например: 1 day")
         return
     await db.set_setting("session_age_value", parts[0])
     await db.set_setting("session_age_period", parts[1])
     await state.clear()
-    await message.answer(f"Возраст сессии: больше {parts[0]} {parts[1]} ✅", reply_markup=FILTERS_MENU)
+    await message.answer(f"Возраст сессии: {parts[0]} {parts[1]} ✅", reply_markup=FILTERS_MENU)
 
 
-# ---------- Списки товаров: «на продаже» / «проданные» ----------
-
-SPAM_LABEL = {"free": "🟢 нет", "limited": "🔴 есть", "unknown": "⚪️ не проверено"}
+SPAM_LABEL = {
+    "free": "🟢 чистый",
+    "limited": "🔴 спам-блок",
+    "unknown": "⚪️ не проверено",
+}
 
 
 def _items_list_keyboard(purchases, prefix: str) -> InlineKeyboardMarkup:
     rows = []
-    row = []
-    for i, p in enumerate(purchases, start=1):
-        row.append(InlineKeyboardButton(text=str(i), callback_data=f"{prefix}:{p['item_id']}"))
-        if len(row) == 5:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
+    for p in purchases[:20]:
+        rows.append([
+            InlineKeyboardButton(
+                text=f"#{p['item_id']} · {p['phone'] or '—'} · {p['sell_price'] or p['price']}₽",
+                callback_data=f"{prefix}:{p['item_id']}",
+            )
+        ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 @dp.message(F.text == "📦 На продаже")
-async def list_on_sale(message: Message, state: FSMContext):
+async def list_listed_items(message: Message, state: FSMContext):
     await state.clear()
     purchases = await db.list_listed_purchases()
     if not purchases:
-        await message.answer("Сейчас ничего не выставлено на продажу.", reply_markup=MAIN_MENU)
+        await message.answer("Сейчас нет товаров на продаже.", reply_markup=MAIN_MENU)
         return
-    lines = ["Товары на продаже — нажми номер, чтобы открыть карточку:\n"]
+    lines = ["Товары на продаже:\n"]
     for i, p in enumerate(purchases, start=1):
-        lines.append(f"{i}. #{p['item_id']} — {p['country'] or '—'}, {p['sell_price'] or '—'}₽")
-    await message.answer(
-        "\n".join(lines),
-        reply_markup=_items_list_keyboard(purchases, "item"),
-    )
+        lines.append(f"{i}. #{p['item_id']} — {p['sell_price'] or '—'}₽ ({p['phone'] or '—'})")
+    await message.answer("\n".join(lines), reply_markup=_items_list_keyboard(purchases, "item"))
 
 
 @dp.message(F.text == "✅ Проданные")
-async def list_sold(message: Message, state: FSMContext):
+async def list_sold_items(message: Message, state: FSMContext):
     await state.clear()
     purchases = await db.list_sold_purchases()
     if not purchases:
@@ -527,10 +498,11 @@ async def retry_listing(callback: CallbackQuery):
 
     sell_price = float(await db.get_setting("sell_price"))
     title_tpl = await db.get_setting("title_template")
+    clean_code = (p["country_code"] or "?").lstrip("+")
     try:
-        title = title_tpl.format(code=p["country_code"] or "?", country=p["country"] or "—")
+        title = title_tpl.format(code=clean_code, country=p["country"] or "—")
     except Exception:
-        title = f"{p['country_code'] or '?'} {p['country'] or '—'} | Чистый | Не трогал"
+        title = f"+{clean_code} {p['country'] or '—'} | Чистый | Не трогал"
 
     after_purchase_note = await db.get_setting("sell_description")
     buyer_note = await db.get_setting("sell_buyer_note")
@@ -539,8 +511,12 @@ async def retry_listing(callback: CallbackQuery):
     try:
         client = _get_lolz_client()
         sell_result = await client.list_for_sale(
-            title=title, price=sell_price, description="", information=information,
-            hex_key=p["hex_key"], dc_id=p["dc_id"],
+            title=title,
+            price=sell_price,
+            description="",
+            information=information,
+            hex_key=p["hex_key"],
+            dc_id=p["dc_id"],
         )
     except LolzError as e:
         await callback.message.answer(f"❌ Снова не получилось: {e}")
@@ -556,7 +532,9 @@ async def retry_listing(callback: CallbackQuery):
 
     await db.update_purchase_status(item_id, "listed")
     await db.set_purchase_extra(
-        item_id, sell_item_id=sell_item_id, sell_price=sell_price,
+        item_id,
+        sell_item_id=sell_item_id,
+        sell_price=sell_price,
         sell_url=f"https://lzt.market/{sell_item_id}/" if sell_item_id else None,
     )
     await callback.message.answer(f"✅ Аккаунт #{item_id} выставлен на продажу за {sell_price}₽")
@@ -592,9 +570,12 @@ async def set_new_item_price(message: Message, state: FSMContext):
     item_id = data.get("edit_item_id")
     new_price = float(message.text)
 
+    p = await db.get_purchase(item_id)
+    target_item_id = (p["sell_item_id"] if p and p["sell_item_id"] else item_id)
+
     try:
         client = _get_lolz_client()
-        await client.edit_item_price(item_id, new_price)
+        await client.edit_item_price(int(target_item_id), new_price)
     except LolzError as e:
         await message.answer(f"❌ Не удалось изменить цену: {e}", reply_markup=MAIN_MENU)
         await state.clear()

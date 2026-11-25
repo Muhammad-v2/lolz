@@ -7,17 +7,17 @@ import asyncio
 import logging
 
 from lztmarketapi import (
-    AsyncLZTMarket,
-    CategoryName,
-    SearchParams,
-    OrderBy,
-    CategoryID,
     APIError,
+    AsyncLZTMarket,
+    CategoryID,
+    CategoryName,
+    OrderBy,
     RateLimitError,
+    SearchParams,
     StatusResponse,
 )
 
-from config import LOLZ_TOKEN, ALLOWED_ORIGINS, SECRET_WORD
+from config import ALLOWED_ORIGINS, LOLZ_TOKEN, SECRET_WORD
 
 log = logging.getLogger("lolz_client")
 
@@ -89,14 +89,24 @@ class LolzClient:
     async def close(self):
         await self._market.aclose()
 
-    async def search_telegram_accounts(self, price_min, price_max, spam="nomatter",
-                                       password="no", session_age_value=1,
-                                       session_age_period="day"):
+    async def search_telegram_accounts(
+        self,
+        price_min,
+        price_max,
+        spam="nomatter",
+        password="no",
+        session_age_value=1,
+        session_age_period="day",
+    ):
         params = SearchParams.model_validate({
-            "pmin": str(price_min), "pmax": str(price_max),
-            "order_by": OrderBy.PRICE_ASC, "origin[]": ALLOWED_ORIGINS,
-            "spam": spam, "password": password,
-            "session_age": session_age_value, "session_age_period": session_age_period,
+            "pmin": str(price_min),
+            "pmax": str(price_max),
+            "order_by": OrderBy.PRICE_ASC,
+            "origin[]": ALLOWED_ORIGINS,
+            "spam": spam,
+            "password": password,
+            "session_age": session_age_value,
+            "session_age_period": session_age_period,
         })
         try:
             response = await self._market.categories.search(CategoryName.TELEGRAM, params)
@@ -118,8 +128,7 @@ class LolzClient:
 
         def _err_blob(e: BaseException) -> str:
             parts = [str(e)]
-            for attr in ("response", "body", "payload", "data", "content",
-                         "message", "errors", "error", "args"):
+            for attr in ("response", "body", "payload", "data", "content", "message", "errors", "error", "args"):
                 val = getattr(e, attr, None)
                 if val is not None:
                     try:
@@ -142,14 +151,20 @@ class LolzClient:
             except (APIError, RateLimitError) as e:
                 last_err = e
                 combined = _err_blob(e)
-                sold_markers = ("item is sold", "item_sold", "already sold",
-                                "продан", "deleted", "удалён", "удален",
-                                "not available", "недоступен")
+                sold_markers = (
+                    "item is sold", "item_sold", "already sold",
+                    "продан", "deleted", "удалён", "удален",
+                    "not available", "недоступен",
+                )
                 if any(x in combined for x in sold_markers) and "retry" not in combined:
                     raise LolzError(f"Лот уже недоступен: {_describe_api_error(e)}") from e
                 is_retry = "retry_request" in combined or "retry request" in combined
-                is_rate = ("429" in combined or "rate limit exceeded" in combined
-                           or "too many requests" in combined or isinstance(e, RateLimitError))
+                is_rate = (
+                    "429" in combined
+                    or "rate limit exceeded" in combined
+                    or "too many requests" in combined
+                    or isinstance(e, RateLimitError)
+                )
                 if is_retry or is_rate:
                     delay = 0.35 if is_retry else min(1.5 + attempt * 0.2, 8)
                     await asyncio.sleep(delay)
@@ -179,7 +194,6 @@ class LolzClient:
     async def get_login_code(self, item_id: int) -> str | None:
         """
         Пытается получить код входа Telegram через Lolz API.
-        Если метод не поддерживается — вернёт None (и бот пойдёт обычным путём).
         """
         for endpoint in (f"/{item_id}/telegram-login-code", f"/{item_id}/login-code"):
             try:
@@ -188,20 +202,46 @@ class LolzClient:
                 extra = getattr(result, "model_extra", None)
                 if extra:
                     data.update(extra)
-                code = data.get("code") or data.get("login_code") or data.get("telegram_code")
-                if code:
-                    log.info("Код получен через Lolz API: %s", endpoint)
-                    return str(code)
-                log.debug("Lolz API %s ответил, но без кода: %s", endpoint, data)
+
+                for key in ("code", "login_code", "telegram_code"):
+                    if data.get(key):
+                        return str(data[key]).strip()
+
+                codes = data.get("codes")
+                if isinstance(codes, list) and codes:
+                    first = codes[0]
+                    if isinstance(first, dict):
+                        val = first.get("code") or first.get("value")
+                        if val:
+                            return str(val).strip()
+                    elif first:
+                        return str(first).strip()
             except Exception as e:
                 log.debug("Lolz API %s не сработал: %s", endpoint, e)
         return None
 
+    async def edit_item_price(self, item_id: int, price: float):
+        """Изменяет цену выставленного на продажу лота."""
+        payload = {"price": float(price), "currency": "rub"}
+        last_err = None
+        for method in ("PUT", "POST"):
+            try:
+                result = await self._market.general.request(
+                    method, f"/{item_id}/edit", StatusResponse, json=payload,
+                )
+                return result.model_dump()
+            except (APIError, RateLimitError) as e:
+                last_err = e
+                continue
+        raise LolzError(f"Не удалось изменить цену: {_describe_api_error(last_err)}")
+
     @staticmethod
     def extract_hex_dc(data: dict) -> tuple[str | None, int | None]:
         hex_key = None
-        for key in ("login", "auth_key", "authKey", "telegram_auth_key",
-                    "telegramAuthKey", "hex", "auth_hex"):
+        for key in (
+            "login", "auth_key", "authKey", "telegram_auth_key",
+            "telegramAuthKey", "hex", "auth_hex",
+        ):
             val = data.get(key)
             if val is not None and str(val).strip():
                 hex_key = str(val).strip()
@@ -248,8 +288,10 @@ class LolzClient:
                 phone = str(val).strip()
                 break
         raw_country = None
-        for key in ("telegram_country", "telegramCountry", "country",
-                    "country_name", "countryCode", "country_code"):
+        for key in (
+            "telegram_country", "telegramCountry", "country",
+            "country_name", "countryCode", "country_code",
+        ):
             val = data.get(key)
             if val is not None and str(val).strip():
                 raw_country = str(val).strip()

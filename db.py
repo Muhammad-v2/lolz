@@ -49,7 +49,6 @@ async def init_db():
                 "ON CONFLICT (key) DO NOTHING",
                 k, str(v)
             )
-        # очередь и переключатель работы — тоже просто настройки
         await con.execute(
             "INSERT INTO settings (key, value) VALUES ('queue_remaining', '0') "
             "ON CONFLICT (key) DO NOTHING"
@@ -58,10 +57,6 @@ async def init_db():
             "INSERT INTO settings (key, value) VALUES ('worker_enabled', '1') "
             "ON CONFLICT (key) DO NOTHING"
         )
-        # Доп. поля для карточки товара в боте (ссылки, данные входа,
-        # статус спам-блока, цена продажи, id выставленного лота).
-        # ALTER ... ADD COLUMN IF NOT EXISTS безопасен и ничего не ломает
-        # в уже работающей таблице.
         for col_def in (
             "sell_item_id BIGINT",
             "sell_price NUMERIC",
@@ -111,7 +106,6 @@ async def get_today_count() -> int:
 
 
 async def add_spent(amount: float):
-    """Добавляет и сумму, и +1 к счётчику купленных сегодня аккаунтов."""
     today = datetime.date.today()
     async with _pool.acquire() as con:
         await con.execute("""
@@ -122,8 +116,6 @@ async def add_spent(amount: float):
         """, today, amount)
 
 
-# ---------- Очередь на покупку (одно число, можно прибавлять/убавлять) ----------
-
 async def get_queue() -> int:
     val = await get_setting("queue_remaining")
     try:
@@ -133,7 +125,6 @@ async def get_queue() -> int:
 
 
 async def add_queue(delta: int):
-    """delta может быть отрицательным — убавляет очередь, но не ниже 0."""
     async with _pool.acquire() as con:
         async with con.transaction():
             row = await con.fetchrow(
@@ -170,8 +161,6 @@ async def queue_consume_one() -> bool:
             return True
 
 
-# ---------- Вкл/выкл рабочего цикла поиска ----------
-
 async def is_enabled() -> bool:
     val = await get_setting("worker_enabled")
     return val == "1"
@@ -180,8 +169,6 @@ async def is_enabled() -> bool:
 async def set_enabled(enabled: bool):
     await set_setting("worker_enabled", "1" if enabled else "0")
 
-
-# ---------- Покупки ----------
 
 async def add_purchase(item_id: int, price: float, phone: str, country: str, country_code: str):
     async with _pool.acquire() as con:
@@ -207,8 +194,6 @@ async def recent_purchases(limit: int = 10):
         )
 
 
-# ---------- Карточка товара (доп. данные для бота) ----------
-
 async def set_purchase_extra(
     item_id: int,
     *,
@@ -221,8 +206,6 @@ async def set_purchase_extra(
     telegram_user_id: str | None = None,
     spam_status: str | None = None,
 ):
-    """Точечно дополняет уже существующую запись покупки — только те
-    поля, что переданы (остальные не трогает)."""
     fields = {
         "sell_item_id": sell_item_id,
         "sell_price": sell_price,
@@ -251,7 +234,6 @@ async def get_purchase(item_id: int):
 
 
 async def list_listed_purchases(limit: int = 50):
-    """Товары, которые сейчас выставлены на продажу (статус 'listed')."""
     async with _pool.acquire() as con:
         return await con.fetch(
             "SELECT * FROM purchases WHERE status='listed' "
@@ -260,7 +242,6 @@ async def list_listed_purchases(limit: int = 50):
 
 
 async def list_sold_purchases(limit: int = 50):
-    """Товары, помеченные как проданные (статус 'sold')."""
     async with _pool.acquire() as con:
         return await con.fetch(
             "SELECT * FROM purchases WHERE status='sold' "
@@ -273,9 +254,6 @@ async def mark_sold(item_id: int):
 
 
 async def list_problem_purchases(limit: int = 50):
-    """Аккаунты с сохранёнными HEX/DC, которые НЕ выставлены на продажу
-    и не помечены проданными — доступ к ним есть, но нужно разобраться
-    руками (например, продажа упала с ошибкой сервера Lolz)."""
     async with _pool.acquire() as con:
         return await con.fetch(
             "SELECT * FROM purchases WHERE hex_key IS NOT NULL "

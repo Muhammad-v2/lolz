@@ -1,23 +1,23 @@
 """
-Фоновый цикл: поиск → покупка → новая сессия → чистка → продажа.
+Фоновый цикл: поиск → покупка → сброс старых сессий → новая сессия → чистка → продажа.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 
+import db
 from lolz_client import LolzClient, LolzError
 from telethon_actions import (
+    AccountPipelineError,
+    check_spam_block,
+    cleanup_account,
     connect_from_hex_dc,
-    terminate_other_sessions,
     create_new_session,
     get_auth_hex_and_dc,
+    terminate_other_sessions,
     terminate_this_session,
-    cleanup_account,
-    check_spam_block,
-    AccountPipelineError,
 )
-import db
 
 log = logging.getLogger("worker")
 
@@ -59,7 +59,10 @@ class Worker:
         session_age_period = await db.get_setting("session_age_period")
 
         items = await self.lolz.search_telegram_accounts(
-            price_min, price_max, spam=spam, password=password,
+            price_min,
+            price_max,
+            spam=spam,
+            password=password,
             session_age_value=session_age_value,
             session_age_period=session_age_period,
         )
@@ -102,12 +105,16 @@ class Worker:
         text = str(e)
         low = text.lower()
         if "not registered" in low or "authkeyunregistered" in low:
-            return ("мёртвая/невалидная сессия от продавца — аккаунт уже не "
-                    "авторизован по этим HEX/DC. Пропускаю этот аккаунт.")
+            return (
+                "мёртвая/невалидная сессия от продавца — аккаунт уже не "
+                "авторизован по этим HEX/DC. Пропускаю этот аккаунт."
+            )
         if "constructor id" in low or "typenotfound" in low:
-            return ("повреждённый ответ от Telegram при чтении данных аккаунта "
-                    "(похоже на нерабочую/битую сессию от продавца, либо устаревшую "
-                    "библиотеку Telethon). Пропускаю этот аккаунт.")
+            return (
+                "повреждённый ответ от Telegram при чтении данных аккаунта "
+                "(похоже на нерабочую/битую сессию от продавца, либо устаревшую "
+                "библиотеку Telethon). Пропускаю этот аккаунт."
+            )
         return text[:500]
 
     async def _buy_and_process(self, item_id: int, price: float, item: dict):
@@ -145,18 +152,20 @@ class Worker:
         bought_client = await connect_from_hex_dc(hex_key_bought, int(dc_id_bought))
         new_client = None
         try:
-            # 1) Пробуем получить код для входа через API Lolz (кнопка
-            #    "получить код"), чтобы не читать историю купленной сессии.
-            lolz_code = await self.lolz.get_login_code(item_id)
-            if lolz_code:
-                await self.send_log(f"🔑 #{item_id}: код получен через Lolz API")
+            # 1) Сбрасываем старые чужие сессии ДО создания новой,
+            #    иначе ResetAuthorizationsRequest убьёт только что созданную сессию!
+            await self.send_log(f"🔒 #{item_id}: завершаю старые чужие сессии...")
+            await terminate_other_sessions(bought_client)
+            await db.update_purchase_status(item_id, "sessions_terminated")
 
-            # 2) Создаём новую сессию.
-            await self.send_log(f"🆕 #{item_id}: создаю новую сессию...")
+            # 2) Создаём новую сессию: код ждём из 777000 и параллельно через Lolz API ПОСЛЕ send_code_request.
+            await self.send_log(f"🆕 #{item_id}: запрашиваю код и создаю новую сессию...")
             try:
                 new_client = await create_new_session(
-                    bought_client, phone, password=cloud_password,
-                    preloaded_code=lolz_code,
+                    bought_client,
+                    phone,
+                    password=cloud_password,
+                    lolz_code_fetcher=lambda: self.lolz.get_login_code(item_id),
                 )
             except AccountPipelineError as e:
                 await db.update_purchase_status(item_id, "error", str(e))
@@ -169,26 +178,23 @@ class Worker:
             hex_key, dc_id = await get_auth_hex_and_dc(new_client)
 
             await db.set_purchase_extra(
-                item_id, hex_key=hex_key, dc_id=dc_id,
+                item_id,
+                hex_key=hex_key,
+                dc_id=dc_id,
                 buy_url=f"https://lzt.market/{item_id}/",
                 telegram_user_id=str(data.get("telegram_id") or data.get("telegramId") or ""),
             )
 
-            # 3) Завершаем чужие сессии (новая уже есть).
-            await self.send_log(f"🔒 #{item_id}: завершаю чужие сессии...")
-            await terminate_other_sessions(bought_client)
-            await db.update_purchase_status(item_id, "sessions_terminated")
-
-            # 4) Чистим купленную сессию.
+            # 3) Чистим аккаунт через новую сессию (либо купленную).
             await self.send_log(f"🧹 #{item_id}: чищу чаты и контакты...")
-            cleanup_report = await cleanup_account(bought_client)
+            cleanup_report = await cleanup_account(new_client)
             await db.update_purchase_status(item_id, "cleaned")
             await self.send_log(
                 f"🧹 #{item_id}: удалено {cleanup_report['deleted']}, "
                 f"не удалось {cleanup_report['failed']}"
             )
 
-            # 5) Проверка спам-блока.
+            # 4) Проверка спам-блока.
             check_spam = (await db.get_setting("check_spam_block")) != "0"
             if check_spam:
                 await self.send_log(f"🔍 #{item_id}: проверяю спам-блок...")
@@ -197,13 +203,14 @@ class Worker:
             else:
                 spam_status = "unknown"
 
-            # 6) Выставляем на продажу.
+            # 5) Выставляем на продажу.
             sell_price = float(await db.get_setting("sell_price"))
             title_tpl = await db.get_setting("title_template")
+            clean_code = (country_code or "?").lstrip("+")
             try:
-                title = title_tpl.format(code=country_code or "?", country=country or "—")
+                title = title_tpl.format(code=clean_code, country=country or "—")
             except Exception:
-                title = f"{country_code or '?'} {country or '—'} | Чистый | Не трогал"
+                title = f"+{clean_code} {country or '—'} | Чистый | Не трогал"
 
             after_purchase_note = await db.get_setting("sell_description")
             buyer_note = await db.get_setting("sell_buyer_note")
@@ -215,8 +222,12 @@ class Worker:
             for attempt in range(1, 4):
                 try:
                     sell_result = await self.lolz.list_for_sale(
-                        title=title, price=sell_price, description="",
-                        information=information, hex_key=hex_key, dc_id=dc_id,
+                        title=title,
+                        price=sell_price,
+                        description="",
+                        information=information,
+                        hex_key=hex_key,
+                        dc_id=dc_id,
                     )
                     last_error = None
                     break
@@ -251,10 +262,13 @@ class Worker:
                     break
 
             await db.set_purchase_extra(
-                item_id, sell_item_id=sell_item_id, sell_price=sell_price,
+                item_id,
+                sell_item_id=sell_item_id,
+                sell_price=sell_price,
                 buy_url=f"https://lzt.market/{item_id}/",
                 sell_url=f"https://lzt.market/{sell_item_id}/" if sell_item_id else None,
-                hex_key=hex_key, dc_id=dc_id,
+                hex_key=hex_key,
+                dc_id=dc_id,
                 telegram_user_id=str(data.get("telegram_id") or data.get("telegramId") or ""),
                 spam_status=spam_status,
             )
