@@ -1,105 +1,3 @@
-"""
-Операции над купленным Telegram-аккаунтом через Telethon.
-
-Правильный пайплайн:
-  1) подключиться по HEX+DC и инициализировать кэш/апдейты
-  2) завершить старые чужие сессии (ДО создания новой!)
-  3) создать НОВУЮ сессию (код из 777000 ИЛИ Lolz API ПОСЛЕ send_code_request)
-  4) забрать HEX+DC новой сессии
-  5) почистить чаты/контакты (оставить только 777000)
-  6) проверить спам-блок через @SpamBot
-  7) завершить купленную сессию — ПОСЛЕ выставления на продажу
-"""
-from __future__ import annotations
-
-import asyncio
-import logging
-import re
-from typing import Awaitable, Callable
-
-from telethon import TelegramClient, events
-from telethon.crypto import AuthKey
-from telethon.errors import (
-    FloodWaitError,
-    PasswordHashInvalidError,
-    PhoneCodeExpiredError,
-    PhoneCodeInvalidError,
-    SessionPasswordNeededError,
-)
-from telethon.sessions import MemorySession
-from telethon.tl.functions.account import UpdateStatusRequest
-from telethon.tl.functions.auth import (
-    LogOutRequest,
-    ResendCodeRequest,
-    ResetAuthorizationsRequest,
-)
-from telethon.tl.functions.channels import LeaveChannelRequest
-from telethon.tl.functions.contacts import DeleteContactsRequest, GetContactsRequest
-
-from config import (
-    API_HASH,
-    API_ID,
-    TG_APP_VERSION,
-    TG_DEVICE_MODEL,
-    TG_LANG_CODE,
-    TG_SYSTEM_LANG_CODE,
-    TG_SYSTEM_VERSION,
-)
-
-log = logging.getLogger("telethon_actions")
-
-TELEGRAM_SERVICE_ID = 777000
-
-DC_ADDRESSES = {
-    1: "149.154.175.53",
-    2: "149.154.167.51",
-    3: "149.154.175.100",
-    4: "149.154.167.91",
-    5: "91.108.56.130",
-}
-
-
-class AccountPipelineError(Exception):
-    pass
-
-
-def _normalize_hex(hex_key: str) -> str:
-    if hex_key is None:
-        raise AccountPipelineError("HEX пустой")
-    h = str(hex_key).strip().lower()
-    h = h.replace(" ", "").replace("\n", "").replace("\r", "").replace("\t", "")
-    if h.startswith("0x"):
-        h = h[2:]
-    if ":" in h:
-        left, right = h.split(":", 1)
-        if left.isdigit() and re.fullmatch(r"[0-9a-f]+", right or ""):
-            h = right
-        elif right.isdigit() and re.fullmatch(r"[0-9a-f]+", left or ""):
-            h = left
-    if not re.fullmatch(r"[0-9a-f]+", h):
-        raise AccountPipelineError(f"HEX содержит недопустимые символы (len={len(h)})")
-    if len(h) != 512:
-        if len(h) % 2 != 0 or len(h) < 64:
-            raise AccountPipelineError(
-                f"Неверная длина HEX auth_key: {len(h)} (ожидается 512)"
-            )
-        log.warning("HEX длина %s вместо 512 — пробуем как есть", len(h))
-    return h
-
-
-def _normalize_phone(phone: str | None) -> str:
-    if not phone:
-        raise AccountPipelineError("Номер телефона пустой — нельзя запросить код")
-    p = re.sub(r"[^\d+]", "", str(phone).strip())
-    if p.startswith("00"):
-        p = "+" + p[2:]
-    if not p.startswith("+") and p.isdigit():
-        p = "+" + p
-    if len(re.sub(r"\D", "", p)) < 8:
-        raise AccountPipelineError(f"Подозрительный номер телефона: {phone}")
-    return p
-
-
 async def _resolve_dc_address(dc_id: int) -> tuple[str, int]:
     """
     Спрашивает у Telegram актуальный IP нужного DC,
@@ -108,8 +6,6 @@ async def _resolve_dc_address(dc_id: int) -> tuple[str, int]:
     bootstrap = TelegramClient(MemorySession(), API_ID, API_HASH)
     try:
         await bootstrap.connect()
-        from telethon.tl.functions.help import GetConfigRequest
-
         config = await bootstrap(GetConfigRequest())
         candidates = [
             o
@@ -176,19 +72,28 @@ async def connect_from_hex_dc(hex_key: str, dc_id: int) -> TelegramClient:
     return client
 
 
+async def _ensure_service_chat_cached(client: TelegramClient, limit: int = 200) -> bool:
+    """
+    Ищет чат 777000 среди диалогов, чтобы поместить его в entity cache.
+    Останавливается сразу, как только чат найден.
+    """
+    try:
+        async for dialog in client.iter_dialogs(limit=limit):
+            if dialog.id == TELEGRAM_SERVICE_ID:
+                return True
+    except Exception as e:
+        log.warning("Не удалось просканировать диалоги для поиска 777000: %s", e)
+    return False
+
+
 async def prepare_client_for_code(client: TelegramClient) -> int:
     """
     Прогревает MemorySession перед запросом кода:
-    - загружает диалоги (помещает 777000 в entity cache),
     - инициализирует состояние обновлений (catch_up),
     - переводит клиент в online, чтобы Telegram видел активную сессию,
+    - находит 777000 в диалогах и помещает его в entity cache,
     - возвращает ID последнего сообщения в чате 777000 (baseline_msg_id).
     """
-    try:
-        await client.get_dialogs(limit=30)
-    except Exception as e:
-        log.warning("Предзагрузка диалогов не удалась: %s", e)
-
     try:
         await client.catch_up()
     except Exception as e:
@@ -199,6 +104,7 @@ async def prepare_client_for_code(client: TelegramClient) -> int:
     except Exception as e:
         log.debug("UpdateStatusRequest: %s", e)
 
+    await _ensure_service_chat_cached(client, limit=200)
     return await _get_last_service_msg_id(client)
 
 
@@ -207,6 +113,8 @@ async def _get_last_service_msg_id(client: TelegramClient) -> int:
         msgs = await client.get_messages(TELEGRAM_SERVICE_ID, limit=1)
         if msgs:
             return int(msgs[0].id)
+    except ValueError:
+        log.info("Чат 777000 не найден в диалогах (baseline_msg_id=0)")
     except Exception as e:
         log.warning("Не удалось прочитать baseline чата 777000: %s", e)
     return 0
@@ -220,27 +128,39 @@ async def terminate_other_sessions(client: TelegramClient) -> None:
     try:
         await client(ResetAuthorizationsRequest())
         log.info("ResetAuthorizations: чужие сессии завершены")
-        await asyncio.sleep(1.5)
+        await asyncio.sleep(2.5)
     except FloodWaitError as e:
         log.warning("FloodWait при ResetAuthorizations: %ss", e.seconds)
         await asyncio.sleep(min(int(e.seconds) + 1, 60))
     except Exception as e:
-        # Например FreshResetAuthorisationForbiddenError, если сессии меньше 24ч
         log.warning("Не удалось завершить чужие сессии (не фатально): %s", e)
 
 
 def _extract_code(text: str | None) -> str | None:
     if not text:
         return None
-    # Приоритет 1: явная фраза с кодом (учитываем длинный русский текст)
     m = re.search(
-        r"(?:login\s*code|код(?:\s+для\s+входа)?(?:\s+в\s+telegram)?)[^\n\d]{0,40}(\d{5,6})\b",
+        r"(?:login\s*code|verification\s*code|code|код(?:\s+для\s+входа)?(?:\s+в\s+telegram)?|código|kode)[^\n\d]{0,40}(\d{5,6})\b",
         text,
         flags=re.IGNORECASE,
     )
     if m and m.group(1) != "777000":
         return m.group(1)
-    # Приоритет 2: любая отдельная группа из 5-6 цифр, кроме 777000
+
+    low = text.lower()
+    if any(
+        marker in low
+        for marker in (
+            "new login",
+            "we detected a login",
+            "новый вход",
+            "обнаружен вход",
+            "terminated",
+            "завершены",
+        )
+    ):
+        return None
+
     for candidate in re.findall(r"(?<!\d)(\d{5,6})(?!\d)", text):
         if candidate != "777000":
             return candidate
@@ -253,43 +173,64 @@ async def _wait_for_code(
     timeout: int = 90,
     lolz_code_fetcher: Callable[[], Awaitable[str | None]] | None = None,
     stale_lolz_code: str | None = None,
+    stale_lolz_known: bool = False,
 ) -> str | None:
     """
-    Ждёт новый код входа из чата 777000 (строго msg.id > baseline_msg_id,
-    без привязки к локальным часам сервера) и параллельно опрашивает Lolz API.
+    Ждёт новый код входа из чата 777000 (строго msg.id > baseline_msg_id).
+    Слушает входящие без привязки к from_users=777000, чтобы не падать при пустом кэше,
+    и подгружает диалоги, если 777000 ещё не закэширован.
     """
     code_holder: dict[str, str | None] = {"code": None}
     seen_ids: set[int] = set()
 
     async def _check_message(msg) -> bool:
-        if msg is None or msg.id in seen_ids:
+        if msg is None or getattr(msg, "id", None) is None:
             return False
-        if int(msg.id) <= baseline_msg_id:
+        msg_id = int(msg.id)
+        if msg_id in seen_ids or msg_id <= baseline_msg_id:
             return False
-        seen_ids.add(msg.id)
+        seen_ids.add(msg_id)
         if getattr(msg, "out", False):
             return False
-        text = getattr(msg, "raw_text", None) or getattr(msg, "message", None) or getattr(msg, "text", None)
+        text = (
+            getattr(msg, "raw_text", None)
+            or getattr(msg, "message", None)
+            or getattr(msg, "text", None)
+        )
         code = _extract_code(text)
         if code:
             code_holder["code"] = code
             return True
         return False
 
-    @client.on(events.NewMessage(from_users=TELEGRAM_SERVICE_ID))
+    @client.on(events.NewMessage(incoming=True))
     async def _on_code(event):
         if code_holder["code"]:
+            return
+        sender_id = getattr(event, "sender_id", None)
+        chat_id = getattr(event, "chat_id", None)
+        if sender_id != TELEGRAM_SERVICE_ID and chat_id != TELEGRAM_SERVICE_ID:
             return
         await _check_message(event.message)
 
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
+    start_ts = loop.time()
+    deadline = start_ts + timeout
     last_lolz_poll = 0.0
+    last_catch_up = 0.0
 
     try:
         while loop.time() < deadline:
             if code_holder["code"]:
                 return code_holder["code"]
+
+            now = loop.time()
+            if (now - last_catch_up) >= 4.5:
+                last_catch_up = now
+                try:
+                    await client.catch_up()
+                except Exception:
+                    pass
 
             try:
                 async for msg in client.iter_messages(TELEGRAM_SERVICE_ID, limit=10):
@@ -297,11 +238,17 @@ async def _wait_for_code(
                         break
                     if await _check_message(msg):
                         return code_holder["code"]
+            except ValueError:
+                await _ensure_service_chat_cached(client, limit=20)
             except Exception as e:
                 log.warning("Ошибка опроса 777000: %s", e)
 
-            now = loop.time()
-            if lolz_code_fetcher is not None and (now - last_lolz_poll) >= 4.0:
+            if (
+                lolz_code_fetcher is not None
+                and stale_lolz_known
+                and (now - start_ts) >= 20.0
+                and (now - last_lolz_poll) >= 5.0
+            ):
                 last_lolz_poll = now
                 try:
                     lcode = await lolz_code_fetcher()
@@ -332,16 +279,33 @@ async def create_new_session(
 
     baseline_msg_id = 0
     stale_lolz_code = None
+    stale_lolz_known = False
     if not preloaded_code:
         baseline_msg_id = await prepare_client_for_code(client_for_code_receiving)
         if lolz_code_fetcher is not None:
             try:
                 stale_lolz_code = await lolz_code_fetcher()
+                stale_lolz_known = stale_lolz_code is not None
             except Exception:
                 stale_lolz_code = None
+                stale_lolz_known = False
+
+    new_session = MemorySession()
+    src_session = getattr(client_for_code_receiving, "session", None)
+    if (
+        src_session is not None
+        and getattr(src_session, "dc_id", None)
+        and getattr(src_session, "server_address", None)
+        and getattr(src_session, "port", None)
+    ):
+        new_session.set_dc(
+            int(src_session.dc_id),
+            src_session.server_address,
+            int(src_session.port),
+        )
 
     new_client = TelegramClient(
-        MemorySession(),
+        new_session,
         API_ID,
         API_HASH,
         device_model=TG_DEVICE_MODEL,
@@ -367,21 +331,21 @@ async def create_new_session(
     next_type = type(sent.next_type).__name__ if getattr(sent, "next_type", None) else "none"
     log.info("Код запрошен для %s: sent.type=%s, next_type=%s", phone, sent_type, next_type)
 
-    # Если Telegram отправил не в приложение (не в 777000), проверяем возможность переотправки или сразу сообщаем
-    if sent_type != "SentCodeTypeApp":
-        if "App" in next_type:
-            try:
-                sent = await new_client(ResendCodeRequest(phone_number=phone, phone_code_hash=sent.phone_code_hash))
-                sent_type = type(sent.type).__name__
-                log.info("ResendCodeRequest: новый sent.type=%s", sent_type)
-            except Exception as e:
-                log.warning("ResendCodeRequest не удался: %s", e)
+    if sent_type != "SentCodeTypeApp" and "App" in next_type:
+        try:
+            sent = await new_client(
+                ResendCodeRequest(phone_number=phone, phone_code_hash=sent.phone_code_hash)
+            )
+            sent_type = type(sent.type).__name__
+            log.info("ResendCodeRequest: новый sent.type=%s", sent_type)
+        except Exception as e:
+            log.warning("ResendCodeRequest не удался: %s", e)
 
     if sent_type != "SentCodeTypeApp" and not preloaded_code:
         await new_client.disconnect()
         raise AccountPipelineError(
-            f"Telegram отправил код через {sent_type} (не в чат 777000). "
-            f"Проверьте API_ID/API_HASH (часто помогает смена пары API или параметров устройства)."
+            f"Telegram отправил код через {sent_type} (не в чат 777000, next_type={next_type}). "
+            f"Проверьте API_ID/API_HASH или параметры устройства."
         )
 
     if preloaded_code:
@@ -394,11 +358,13 @@ async def create_new_session(
             timeout=90,
             lolz_code_fetcher=lolz_code_fetcher,
             stale_lolz_code=stale_lolz_code,
+            stale_lolz_known=stale_lolz_known,
         )
         if not code:
             await new_client.disconnect()
             raise AccountPipelineError(
-                f"Код входа (sent.type={sent_type}) не пришёл в чат 777000 за 90 секунд"
+                f"Код входа (sent.type={sent_type}, baseline={baseline_msg_id}) "
+                f"не прочитан из чата 777000 за 90 секунд"
             )
         log.info("Код получен: %s", code)
 
@@ -595,3 +561,4 @@ async def check_spam_block(client: TelegramClient, timeout: int = 20) -> str:
         await asyncio.sleep(1.5)
 
     return "unknown"
+# --- КОНЕЦ ФАЙЛА telethon_actions.py ---
