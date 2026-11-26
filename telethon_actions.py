@@ -1,15 +1,96 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+import re
+from typing import Awaitable, Callable
+
+from telethon import TelegramClient, events
+from telethon.crypto import AuthKey
+from telethon.errors import (
+    FloodWaitError,
+    PasswordHashInvalidError,
+    PhoneCodeExpiredError,
+    PhoneCodeInvalidError,
+    SessionPasswordNeededError,
+)
+from telethon.sessions import MemorySession
+from telethon.tl.functions.account import UpdateStatusRequest
+from telethon.tl.functions.auth import LogOutRequest, ResendCodeRequest, ResetAuthorizationsRequest
+from telethon.tl.functions.channels import LeaveChannelRequest
+from telethon.tl.functions.contacts import DeleteContactsRequest, GetContactsRequest
+from telethon.tl.functions.help import GetConfigRequest
+
+from config import (
+    API_HASH,
+    API_ID,
+    TG_APP_VERSION,
+    TG_DEVICE_MODEL,
+    TG_LANG_CODE,
+    TG_SYSTEM_LANG_CODE,
+    TG_SYSTEM_VERSION,
+)
+
+log = logging.getLogger("telethon_actions")
+
+TELEGRAM_SERVICE_ID = 777000
+SPAMBOT_USERNAME = "SpamBot"
+
+DC_ADDRESSES = {
+    1: "149.154.175.53",
+    2: "149.154.167.51",
+    3: "149.154.175.100",
+    4: "149.154.167.91",
+    5: "91.108.56.130",
+}
+
+
+class AccountPipelineError(Exception):
+    pass
+
+
+def _normalize_hex(hex_key: str) -> str:
+    if hex_key is None:
+        raise AccountPipelineError("HEX пустой")
+    h = str(hex_key).strip().lower()
+    h = h.replace(" ", "").replace("\n", "").replace("\r", "").replace("\t", "")
+    if h.startswith("0x"):
+        h = h[2:]
+    if ":" in h:
+        left, right = h.split(":", 1)
+        if left.isdigit() and re.fullmatch(r"[0-9a-f]+", right or ""):
+            h = right
+        elif right.isdigit() and re.fullmatch(r"[0-9a-f]+", left or ""):
+            h = left
+    if not re.fullmatch(r"[0-9a-f]+", h):
+        raise AccountPipelineError(f"HEX содержит недопустимые символы (len={len(h)})")
+    if len(h) != 512:
+        if len(h) % 2 != 0 or len(h) < 64:
+            raise AccountPipelineError(f"Неверная длина HEX auth_key: {len(h)} (ожидается 512)")
+        log.warning("HEX длина %s вместо 512 — пробуем как есть", len(h))
+    return h
+
+
+def _normalize_phone(phone: str | None) -> str:
+    if not phone:
+        raise AccountPipelineError("Номер телефона пустой — нельзя запросить код")
+    p = re.sub(r"[^\d+]", "", str(phone).strip())
+    if p.startswith("00"):
+        p = "+" + p[2:]
+    if not p.startswith("+") and p.isdigit():
+        p = "+" + p
+    if len(re.sub(r"\D", "", p)) < 8:
+        raise AccountPipelineError(f"Подозрительный номер телефона: {phone}")
+    return p
+
+
 async def _resolve_dc_address(dc_id: int) -> tuple[str, int]:
-    """
-    Спрашивает у Telegram актуальный IP нужного DC,
-    при ошибке возвращает запасной адрес из DC_ADDRESSES.
-    """
     bootstrap = TelegramClient(MemorySession(), API_ID, API_HASH)
     try:
         await bootstrap.connect()
         config = await bootstrap(GetConfigRequest())
         candidates = [
-            o
-            for o in config.dc_options
+            o for o in config.dc_options
             if o.id == dc_id and not o.ipv6 and not o.media_only and not o.tcpo_only
         ]
         if not candidates:
@@ -33,7 +114,6 @@ async def connect_from_hex_dc(hex_key: str, dc_id: int) -> TelegramClient:
 
     dc_id = int(dc_id)
     ip, port = await _resolve_dc_address(dc_id)
-
     h = _normalize_hex(hex_key)
     try:
         key_bytes = bytes.fromhex(h)
@@ -63,9 +143,7 @@ async def connect_from_hex_dc(hex_key: str, dc_id: int) -> TelegramClient:
 
     if not await client.is_user_authorized():
         await client.disconnect()
-        raise AccountPipelineError(
-            "Купленный аккаунт не авторизован (HEX/DC неверны или сессия уже убита)"
-        )
+        raise AccountPipelineError("Купленный аккаунт не авторизован (HEX/DC неверны или сессия уже убита)")
 
     me = await client.get_me()
     log.info("Подключены как %s (id=%s) через DC%s", me.phone or me.username, me.id, dc_id)
@@ -73,10 +151,6 @@ async def connect_from_hex_dc(hex_key: str, dc_id: int) -> TelegramClient:
 
 
 async def _ensure_service_chat_cached(client: TelegramClient, limit: int = 200) -> bool:
-    """
-    Ищет чат 777000 среди диалогов, чтобы поместить его в entity cache.
-    Останавливается сразу, как только чат найден.
-    """
     try:
         async for dialog in client.iter_dialogs(limit=limit):
             if dialog.id == TELEGRAM_SERVICE_ID:
@@ -87,13 +161,6 @@ async def _ensure_service_chat_cached(client: TelegramClient, limit: int = 200) 
 
 
 async def prepare_client_for_code(client: TelegramClient) -> int:
-    """
-    Прогревает MemorySession перед запросом кода:
-    - инициализирует состояние обновлений (catch_up),
-    - переводит клиент в online, чтобы Telegram видел активную сессию,
-    - находит 777000 в диалогах и помещает его в entity cache,
-    - возвращает ID последнего сообщения в чате 777000 (baseline_msg_id).
-    """
     try:
         await client.catch_up()
     except Exception as e:
@@ -121,10 +188,6 @@ async def _get_last_service_msg_id(client: TelegramClient) -> int:
 
 
 async def terminate_other_sessions(client: TelegramClient) -> None:
-    """
-    Завершает все сессии кроме текущей (bought_client).
-    ВАЖНО: вызывать строго ДО create_new_session, иначе убьёт новую сессию!
-    """
     try:
         await client(ResetAuthorizationsRequest())
         log.info("ResetAuthorizations: чужие сессии завершены")
@@ -150,14 +213,7 @@ def _extract_code(text: str | None) -> str | None:
     low = text.lower()
     if any(
         marker in low
-        for marker in (
-            "new login",
-            "we detected a login",
-            "новый вход",
-            "обнаружен вход",
-            "terminated",
-            "завершены",
-        )
+        for marker in ("new login", "we detected a login", "новый вход", "обнаружен вход", "terminated", "завершены")
     ):
         return None
 
@@ -175,11 +231,6 @@ async def _wait_for_code(
     stale_lolz_code: str | None = None,
     stale_lolz_known: bool = False,
 ) -> str | None:
-    """
-    Ждёт новый код входа из чата 777000 (строго msg.id > baseline_msg_id).
-    Слушает входящие без привязки к from_users=777000, чтобы не падать при пустом кэше,
-    и подгружает диалоги, если 777000 ещё не закэширован.
-    """
     code_holder: dict[str, str | None] = {"code": None}
     seen_ids: set[int] = set()
 
@@ -192,11 +243,7 @@ async def _wait_for_code(
         seen_ids.add(msg_id)
         if getattr(msg, "out", False):
             return False
-        text = (
-            getattr(msg, "raw_text", None)
-            or getattr(msg, "message", None)
-            or getattr(msg, "text", None)
-        )
+        text = getattr(msg, "raw_text", None) or getattr(msg, "message", None) or getattr(msg, "text", None)
         code = _extract_code(text)
         if code:
             code_holder["code"] = code
@@ -272,9 +319,6 @@ async def create_new_session(
     preloaded_code: str | None = None,
     lolz_code_fetcher: Callable[[], Awaitable[str | None]] | None = None,
 ) -> TelegramClient:
-    """
-    Создаёт новую сессию через send_code_request + чтение 777000 / Lolz API.
-    """
     phone = _normalize_phone(phone)
 
     baseline_msg_id = 0
@@ -298,11 +342,7 @@ async def create_new_session(
         and getattr(src_session, "server_address", None)
         and getattr(src_session, "port", None)
     ):
-        new_session.set_dc(
-            int(src_session.dc_id),
-            src_session.server_address,
-            int(src_session.port),
-        )
+        new_session.set_dc(int(src_session.dc_id), src_session.server_address, int(src_session.port))
 
     new_client = TelegramClient(
         new_session,
@@ -320,9 +360,7 @@ async def create_new_session(
         sent = await new_client.send_code_request(phone)
     except FloodWaitError as e:
         await new_client.disconnect()
-        raise AccountPipelineError(
-            f"FloodWait при запросе кода: подожди {e.seconds}с"
-        ) from e
+        raise AccountPipelineError(f"FloodWait при запросе кода: подожди {e.seconds}с") from e
     except Exception as e:
         await new_client.disconnect()
         raise AccountPipelineError(f"Не удалось запросить код: {e}") from e
@@ -333,9 +371,7 @@ async def create_new_session(
 
     if sent_type != "SentCodeTypeApp" and "App" in next_type:
         try:
-            sent = await new_client(
-                ResendCodeRequest(phone_number=phone, phone_code_hash=sent.phone_code_hash)
-            )
+            sent = await new_client(ResendCodeRequest(phone_number=phone, phone_code_hash=sent.phone_code_hash))
             sent_type = type(sent.type).__name__
             log.info("ResendCodeRequest: новый sent.type=%s", sent_type)
         except Exception as e:
@@ -369,17 +405,11 @@ async def create_new_session(
         log.info("Код получен: %s", code)
 
     try:
-        await new_client.sign_in(
-            phone=phone,
-            code=code,
-            phone_code_hash=sent.phone_code_hash,
-        )
+        await new_client.sign_in(phone=phone, code=code, phone_code_hash=sent.phone_code_hash)
     except SessionPasswordNeededError:
         if not password:
             await new_client.disconnect()
-            raise AccountPipelineError(
-                "На аккаунте 2FA, пароль неизвестен. Ставь фильтр «Пароль: Нет»."
-            )
+            raise AccountPipelineError("На аккаунте 2FA, пароль неизвестен. Ставь фильтр «Пароль: Нет».")
         try:
             await new_client.sign_in(password=password)
         except PasswordHashInvalidError as e:
@@ -431,10 +461,6 @@ async def terminate_this_session(client: TelegramClient) -> None:
 
 
 async def cleanup_account(client: TelegramClient) -> dict:
-    """
-    Удаляет ВСЕ чаты/группы/каналы, кроме служебного чата Telegram (777000),
-    и чистит контакты. Возвращает отчёт.
-    """
     report = {"deleted": 0, "failed": 0, "errors": []}
     try:
         await client.get_dialogs(limit=200)
@@ -481,17 +507,7 @@ async def cleanup_account(client: TelegramClient) -> dict:
     return report
 
 
-# ---------- Проверка спам-блока через официального @SpamBot ----------
-
-SPAMBOT_USERNAME = "SpamBot"
-
-
 async def check_spam_block(client: TelegramClient, timeout: int = 20) -> str:
-    """
-    Пишет официальному @SpamBot «/start» и разбирает именно НОВЫЙ ответ
-    (msg.id > last_id и входящее сообщение).
-    Возвращает 'free', 'limited' или 'unknown'.
-    """
     try:
         bot_entity = await client.get_entity(SPAMBOT_USERNAME)
     except Exception as e:
@@ -534,26 +550,14 @@ async def check_spam_block(client: TelegramClient, timeout: int = 20) -> str:
                     continue
                 if any(
                     p in text
-                    for p in (
-                        "good news",
-                        "no limits",
-                        "не ограничен",
-                        "хороших новостей",
-                        "свободен",
-                    )
+                    for p in ("good news", "no limits", "не ограничен", "хороших новостей", "свободен")
                 ) and not any(
                     p in text for p in ("temporary", "limited", "ограничен", "restrict")
                 ):
                     return "free"
                 if any(
                     p in text
-                    for p in (
-                        "temporarily limited",
-                        "limited",
-                        "ограничен",
-                        "restrict",
-                        "read-only",
-                    )
+                    for p in ("temporarily limited", "limited", "ограничен", "restrict", "read-only")
                 ):
                     return "limited"
         except Exception:
@@ -561,4 +565,3 @@ async def check_spam_block(client: TelegramClient, timeout: int = 20) -> str:
         await asyncio.sleep(1.5)
 
     return "unknown"
-# --- КОНЕЦ ФАЙЛА telethon_actions.py ---
