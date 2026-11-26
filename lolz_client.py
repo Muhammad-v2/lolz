@@ -197,11 +197,9 @@ class LolzClient:
         """
         for endpoint in (f"/{item_id}/telegram-login-code", f"/{item_id}/login-code"):
             try:
-                result = await self._market.general.request("GET", endpoint, StatusResponse)
-                data = result.model_dump()
-                extra = getattr(result, "model_extra", None)
-                if extra:
-                    data.update(extra)
+                data = await self._market.general.request("GET", endpoint, dict)
+                if not isinstance(data, dict):
+                    continue
 
                 for key in ("code", "login_code", "telegram_code"):
                     if data.get(key):
