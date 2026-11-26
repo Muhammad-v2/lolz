@@ -130,7 +130,7 @@ class Worker:
         cloud_password = None
         for key in ("telegram_password", "cloud_password", "password_2fa", "tfa_password"):
             val = data.get(key)
-            if val and str(val).strip() and not str(val).strip().isdigit():
+            if val is not None and str(val).strip():
                 cloud_password = str(val).strip()
                 break
 
@@ -158,7 +158,7 @@ class Worker:
             await terminate_other_sessions(bought_client)
             await db.update_purchase_status(item_id, "sessions_terminated")
 
-            # 2) Создаём новую сессию: код ждём из 777000 и параллельно через Lolz API ПОСЛЕ send_code_request.
+            # 2) Создаём новую сессию: код ждём из 777000 и резервно через Lolz API ПОСЛЕ send_code_request.
             await self.send_log(f"🆕 #{item_id}: запрашиваю код и создаю новую сессию...")
             try:
                 new_client = await create_new_session(
@@ -185,7 +185,7 @@ class Worker:
                 telegram_user_id=str(data.get("telegram_id") or data.get("telegramId") or ""),
             )
 
-            # 3) Чистим аккаунт через новую сессию (либо купленную).
+            # 3) Чистим аккаунт через новую сессию.
             await self.send_log(f"🧹 #{item_id}: чищу чаты и контакты...")
             cleanup_report = await cleanup_account(new_client)
             await db.update_purchase_status(item_id, "cleaned")
