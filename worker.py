@@ -8,6 +8,7 @@ import logging
 
 import db
 from lolz_client import LolzClient, LolzError
+from email_login import try_attach_email
 from telethon_actions import (
     AccountPipelineError,
     check_spam_block,
@@ -189,6 +190,10 @@ class Worker:
             await self.send_log(f"🧹 #{item_id}: чищу чаты и контакты...")
             cleanup_report = await cleanup_account(new_client)
             await db.update_purchase_status(item_id, "cleaned")
+try:                                        # ← ДОБАВИТЬ
+                await try_attach_email(new_client)       # ← ДОБАВИТЬ
+            except Exception:                            # ← ДОБАВИТЬ
+                pass
             await self.send_log(
                 f"🧹 #{item_id}: удалено {cleanup_report['deleted']}, "
                 f"не удалось {cleanup_report['failed']}"
