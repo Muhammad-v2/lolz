@@ -16,10 +16,22 @@ from lztmarketapi import (
     SearchParams,
     StatusResponse,
 )
+from pydantic import BaseModel, ConfigDict
 
 from config import ALLOWED_ORIGINS, LOLZ_TOKEN, SECRET_WORD
 
 log = logging.getLogger("lolz_client")
+
+
+class _AnyResponse(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    def to_dict(self) -> dict:
+        data = self.model_dump()
+        extra = getattr(self, "model_extra", None)
+        if extra:
+            data.update(extra)
+        return data
 
 
 def _describe_api_error(e: BaseException) -> str:
@@ -40,20 +52,21 @@ COUNTRY_INFO = {
     "TJ": ("Таджикистан", "992"), "AM": ("Армения", "374"), "AZ": ("Азербайджан", "994"),
     "GE": ("Грузия", "995"), "MD": ("Молдова", "373"), "IN": ("Индия", "91"),
     "ID": ("Индонезия", "62"), "PH": ("Филиппины", "63"), "VN": ("Вьетнам", "84"),
-    "TH": ("Таиланд", "66"), "MY": ("Малайзия", "60"), "BD": ("Бангладеш", "880"),
-    "PK": ("Пакистан", "92"), "NP": ("Непал", "977"), "LK": ("Шри-Ланка", "94"),
-    "CN": ("Китай", "86"), "HK": ("Гонконг", "852"), "TW": ("Тайвань", "886"),
-    "JP": ("Япония", "81"), "KR": ("Южная Корея", "82"), "US": ("США", "1"),
-    "CA": ("Канада", "1"), "GB": ("Великобритания", "44"), "UK": ("Великобритания", "44"),
-    "DE": ("Германия", "49"), "FR": ("Франция", "33"), "IT": ("Италия", "39"),
-    "ES": ("Испания", "34"), "PL": ("Польша", "48"), "RO": ("Румыния", "40"),
-    "CZ": ("Чехия", "420"), "NL": ("Нидерланды", "31"), "BE": ("Бельгия", "32"),
-    "TR": ("Турция", "90"), "EG": ("Египет", "20"), "NG": ("Нигерия", "234"),
-    "ZA": ("ЮАР", "27"), "BR": ("Бразилия", "55"), "AR": ("Аргентина", "54"),
-    "MX": ("Мексика", "52"), "CO": ("Колумбия", "57"), "PE": ("Перу", "51"),
-    "CL": ("Чили", "56"), "AE": ("ОАЭ", "971"), "SA": ("Саудовская Аравия", "966"),
-    "IL": ("Израиль", "972"), "IQ": ("Ирак", "964"), "IR": ("Иран", "98"),
-    "AF": ("Афганистан", "93"), "MM": ("Мьянма", "95"),"AU": ("Австралия", "61"), "NZ": ("Новая Зеландия", "64"),
+    "TH": ("Таиланд", "66"), "MY": ("Малайзия", "60"), "MM": ("Мьянма", "95"),
+    "BD": ("Бангладеш", "880"), "PK": ("Пакистан", "92"), "NP": ("Непал", "977"),
+    "LK": ("Шри-Ланка", "94"), "CN": ("Китай", "86"), "HK": ("Гонконг", "852"),
+    "TW": ("Тайвань", "886"), "JP": ("Япония", "81"), "KR": ("Южная Корея", "82"),
+    "US": ("США", "1"), "CA": ("Канада", "1"), "GB": ("Великобритания", "44"),
+    "UK": ("Великобритания", "44"), "DE": ("Германия", "49"), "FR": ("Франция", "33"),
+    "IT": ("Италия", "39"), "ES": ("Испания", "34"), "PL": ("Польша", "48"),
+    "RO": ("Румыния", "40"), "CZ": ("Чехия", "420"), "NL": ("Нидерланды", "31"),
+    "BE": ("Бельгия", "32"), "TR": ("Турция", "90"), "EG": ("Египет", "20"),
+    "NG": ("Нигерия", "234"), "ZA": ("ЮАР", "27"), "BR": ("Бразилия", "55"),
+    "AR": ("Аргентина", "54"), "MX": ("Мексика", "52"), "CO": ("Колумбия", "57"),
+    "PE": ("Перу", "51"), "CL": ("Чили", "56"), "AE": ("ОАЭ", "971"),
+    "SA": ("Саудовская Аравия", "966"), "IL": ("Израиль", "972"), "IQ": ("Ирак", "964"),
+    "IR": ("Иран", "98"), "AF": ("Афганистан", "93"), "AU": ("Австралия", "61"),
+    "NZ": ("Новая Зеландия", "64"),
 }
 
 PHONE_PREFIXES = sorted([
@@ -61,12 +74,13 @@ PHONE_PREFIXES = sorted([
     ("977", "NP"), ("971", "AE"), ("966", "SA"), ("972", "IL"), ("964", "IQ"),
     ("880", "BD"), ("852", "HK"), ("886", "TW"), ("380", "UA"), ("375", "BY"),
     ("374", "AM"), ("373", "MD"), ("420", "CZ"), ("234", "NG"), ("98", "IR"),
-    ("93", "AF"), ("95", "MM"), ("92", "PK"), ("91", "IN"), ("90", "TR"), ("86", "CN"),
-    ("84", "VN"), ("82", "KR"), ("81", "JP"), ("66", "TH"), ("63", "PH"),
-    ("62", "ID"), ("61", "AU"), ("60", "MY"), ("55", "BR"), ("54", "AR"),
-    ("52", "MX"), ("51", "PE"), ("49", "DE"), ("48", "PL"), ("44", "GB"),
-    ("40", "RO"), ("39", "IT"), ("34", "ES"), ("33", "FR"), ("32", "BE"),
-    ("31", "NL"), ("27", "ZA"), ("20", "EG"), ("7", "RU"), ("1", "US"),
+    ("95", "MM"), ("93", "AF"), ("92", "PK"), ("91", "IN"), ("90", "TR"),
+    ("86", "CN"), ("84", "VN"), ("82", "KR"), ("81", "JP"), ("66", "TH"),
+    ("63", "PH"), ("62", "ID"), ("61", "AU"), ("60", "MY"), ("55", "BR"),
+    ("54", "AR"), ("52", "MX"), ("51", "PE"), ("49", "DE"), ("48", "PL"),
+    ("44", "GB"), ("40", "RO"), ("39", "IT"), ("34", "ES"), ("33", "FR"),
+    ("32", "BE"), ("31", "NL"), ("27", "ZA"), ("20", "EG"), ("7", "RU"),
+    ("1", "US"),
 ], key=lambda x: -len(x[0]))
 
 NAME_TO_ISO = {
@@ -78,7 +92,8 @@ NAME_TO_ISO = {
     "филиппины": "PH", "vietnam": "VN", "вьетнам": "VN", "china": "CN",
     "китай": "CN", "turkey": "TR", "турция": "TR", "brazil": "BR", "бразилия": "BR",
     "germany": "DE", "германия": "DE", "france": "FR", "франция": "FR",
-    "uk": "GB", "united kingdom": "GB", "великобритания": "GB","myanmar": "MM", "мьянма": "MM", "burma": "MM", "бирма": "MM",
+    "uk": "GB", "united kingdom": "GB", "великобритания": "GB",
+    "myanmar": "MM", "мьянма": "MM", "burma": "MM", "бирма": "MM",
 }
 
 
@@ -116,8 +131,14 @@ class LolzClient:
 
     async def get_balance(self):
         try:
-            result = await self._market.general.request("GET", "/me", dict)
-            return result.get("balance", 0)
+            result = await self._market.general.request("GET", "/me", _AnyResponse)
+            data = result.to_dict()
+            if data.get("balance") is not None:
+                return data["balance"]
+            user = data.get("user")
+            if isinstance(user, dict) and user.get("balance") is not None:
+                return user["balance"]
+            return 0
         except Exception as e:
             raise LolzError(f"Не удалось получить баланс: {_describe_api_error(e)}") from e
 
@@ -197,9 +218,8 @@ class LolzClient:
         """
         for endpoint in (f"/{item_id}/telegram-login-code", f"/{item_id}/login-code"):
             try:
-                data = await self._market.general.request("GET", endpoint, dict)
-                if not isinstance(data, dict):
-                    continue
+                result = await self._market.general.request("GET", endpoint, _AnyResponse)
+                data = result.to_dict()
 
                 for key in ("code", "login_code", "telegram_code"):
                     if data.get(key):
