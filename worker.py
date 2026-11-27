@@ -1,5 +1,5 @@
 """
-Фоновый цикл: поиск → покупка → сброс старых сессий → новая сессия → чистка → продажа.
+Фоновый цикл: поиск → покупка → сброс старых сессий → новая сессия → чистка → смена почты → продажа.
 """
 from __future__ import annotations
 
@@ -159,15 +159,26 @@ class Worker:
             await terminate_other_sessions(bought_client)
             await db.update_purchase_status(item_id, "sessions_terminated")
 
-            # 2) Создаём новую сессию: код ждём из 777000 и резервно через Lolz API ПОСЛЕ send_code_request.
+            # 2) Создаём новую сессию с жёстким общим таймаутом 140с.
             await self.send_log(f"🆕 #{item_id}: запрашиваю код и создаю новую сессию...")
             try:
-                new_client = await create_new_session(
-                    bought_client,
-                    phone,
-                    password=cloud_password,
-                    lolz_code_fetcher=lambda: self.lolz.get_login_code(item_id),
+                new_client = await asyncio.wait_for(
+                    create_new_session(
+                        bought_client,
+                        phone,
+                        password=cloud_password,
+                        lolz_code_fetcher=lambda: self.lolz.get_login_code(item_id),
+                    ),
+                    timeout=140,
                 )
+            except asyncio.TimeoutError:
+                err_msg = "таймаут создания новой сессии (140с) — сокет Telegram завис"
+                await db.update_purchase_status(item_id, "error", err_msg)
+                await self.send_log(
+                    f"❌ #{item_id}: {err_msg}. "
+                    f"Купленная сессия НЕ завершена — доступ не потерян."
+                )
+                raise AccountPipelineError(err_msg)
             except AccountPipelineError as e:
                 await db.update_purchase_status(item_id, "error", str(e))
                 await self.send_log(
@@ -186,18 +197,23 @@ class Worker:
                 telegram_user_id=str(data.get("telegram_id") or data.get("telegramId") or ""),
             )
 
-            # 3) Чистим аккаунт через новую сессию.
+            # 3) Чистим аккаунт и меняем почту через новую сессию.
             await self.send_log(f"🧹 #{item_id}: чищу чаты и контакты...")
             cleanup_report = await cleanup_account(new_client)
             await db.update_purchase_status(item_id, "cleaned")
-            try:
-                await try_attach_email(new_client)
-            except Exception:
-                pass
             await self.send_log(
                 f"🧹 #{item_id}: удалено {cleanup_report['deleted']}, "
                 f"не удалось {cleanup_report['failed']}"
             )
+
+            try:
+                email_ok, email_info = await try_attach_email(new_client)
+                if email_ok:
+                    await self.send_log(f"📧 #{item_id}: почта изменена на {email_info}")
+                else:
+                    await self.send_log(f"ℹ️ #{item_id}: почта не изменена ({email_info})")
+            except Exception as e:
+                await self.send_log(f"⚠️ #{item_id}: ошибка смены почты ({e})")
 
             # 4) Проверка спам-блока.
             check_spam = (await db.get_setting("check_spam_block")) != "0"
