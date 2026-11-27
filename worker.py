@@ -190,9 +190,9 @@ class Worker:
             await self.send_log(f"🧹 #{item_id}: чищу чаты и контакты...")
             cleanup_report = await cleanup_account(new_client)
             await db.update_purchase_status(item_id, "cleaned")
-try:                                        # ← ДОБАВИТЬ
-                await try_attach_email(new_client)       # ← ДОБАВИТЬ
-            except Exception:                            # ← ДОБАВИТЬ
+            try:
+                await try_attach_email(new_client)
+            except Exception:
                 pass
             await self.send_log(
                 f"🧹 #{item_id}: удалено {cleanup_report['deleted']}, "
