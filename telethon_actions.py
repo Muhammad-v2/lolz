@@ -20,6 +20,7 @@ from telethon.tl.functions.auth import LogOutRequest, ResendCodeRequest, ResetAu
 from telethon.tl.functions.channels import LeaveChannelRequest
 from telethon.tl.functions.contacts import DeleteContactsRequest, GetContactsRequest
 from telethon.tl.functions.help import GetConfigRequest
+from telethon.tl.types import InputPeerUser, PeerUser
 
 from config import (
     API_HASH,
@@ -153,21 +154,38 @@ async def connect_from_hex_dc(hex_key: str, dc_id: int) -> TelegramClient:
     return client
 
 
-async def _ensure_service_chat_cached(client: TelegramClient, limit: int = 200) -> bool:
-    async def _scan():
-        async for dialog in client.iter_dialogs(limit=limit):
-            if dialog.id == TELEGRAM_SERVICE_ID:
-                return True
-        return False
+async def _resolve_service_peer(client: TelegramClient):
+    """
+    Возвращает entity или InputPeerUser для чата 777000,
+    проверяя основной список диалогов и архив (folder=1).
+    """
+    try:
+        return await asyncio.wait_for(client.get_input_entity(TELEGRAM_SERVICE_ID), timeout=4)
+    except Exception:
+        pass
+
+    for folder in (None, 1):
+        try:
+            async def _scan(f=folder):
+                kwargs = {"limit": 200} if f is None else {"limit": 50, "folder": f}
+                async for dialog in client.iter_dialogs(**kwargs):
+                    if dialog.id == TELEGRAM_SERVICE_ID:
+                        return dialog.input_entity
+                return None
+
+            peer = await asyncio.wait_for(_scan(), timeout=20)
+            if peer is not None:
+                return peer
+        except Exception as e:
+            log.debug("Скан диалогов (folder=%s) для 777000: %s", folder, e)
 
     try:
-        return await asyncio.wait_for(_scan(), timeout=12)
-    except Exception as e:
-        log.warning("Не удалось просканировать диалоги для поиска 777000: %s", e)
-        return False
+        return await asyncio.wait_for(client.get_entity(PeerUser(TELEGRAM_SERVICE_ID)), timeout=6)
+    except Exception:
+        return InputPeerUser(TELEGRAM_SERVICE_ID, 0)
 
 
-async def prepare_client_for_code(client: TelegramClient) -> int:
+async def prepare_client_for_code(client: TelegramClient) -> tuple[int, str, object]:
     try:
         await asyncio.wait_for(client.catch_up(), timeout=8)
     except Exception as e:
@@ -178,20 +196,22 @@ async def prepare_client_for_code(client: TelegramClient) -> int:
     except Exception as e:
         log.debug("UpdateStatusRequest: %s", e)
 
-    await _ensure_service_chat_cached(client, limit=200)
-    return await _get_last_service_msg_id(client)
+    peer = await _resolve_service_peer(client)
+    baseline_id, last_date = await _get_last_service_msg_info(client, peer)
+    return baseline_id, last_date, peer
 
 
-async def _get_last_service_msg_id(client: TelegramClient) -> int:
+async def _get_last_service_msg_info(client: TelegramClient, peer=None) -> tuple[int, str]:
+    target = peer or TELEGRAM_SERVICE_ID
     try:
-        msgs = await asyncio.wait_for(client.get_messages(TELEGRAM_SERVICE_ID, limit=1), timeout=10)
+        msgs = await asyncio.wait_for(client.get_messages(target, limit=1), timeout=10)
         if msgs:
-            return int(msgs[0].id)
-    except ValueError:
-        log.info("Чат 777000 не найден в диалогах (baseline_msg_id=0)")
+            m = msgs[0]
+            dt = m.date.strftime("%Y-%m-%d %H:%M:%S") if getattr(m, "date", None) else "—"
+            return int(m.id), dt
     except Exception as e:
         log.warning("Не удалось прочитать baseline чата 777000: %s", e)
-    return 0
+    return 0, "—"
 
 
 async def terminate_other_sessions(client: TelegramClient) -> None:
@@ -233,6 +253,7 @@ def _extract_code(text: str | None) -> str | None:
 async def _wait_for_code(
     client: TelegramClient,
     baseline_msg_id: int,
+    service_peer=None,
     timeout: int = 80,
     lolz_code_fetcher: Callable[[], Awaitable[str | None]] | None = None,
     stale_lolz_code: str | None = None,
@@ -241,6 +262,7 @@ async def _wait_for_code(
 ) -> str | None:
     code_holder: dict[str, str | None] = {"code": None}
     seen_ids: set[int] = set()
+    peer_holder = {"peer": service_peer or TELEGRAM_SERVICE_ID}
 
     async def _check_message(msg) -> bool:
         if msg is None or getattr(msg, "id", None) is None:
@@ -269,7 +291,7 @@ async def _wait_for_code(
         await _check_message(event.message)
 
     async def _poll_messages() -> str | None:
-        async for msg in client.iter_messages(TELEGRAM_SERVICE_ID, limit=10):
+        async for msg in client.iter_messages(peer_holder["peer"], limit=10):
             if int(msg.id) <= baseline_msg_id:
                 break
             if await _check_message(msg):
@@ -290,7 +312,6 @@ async def _wait_for_code(
 
             now = loop.time()
 
-            # Если через 30с код так и не пришёл — перезапрашиваем один раз
             if not resent_once and on_resend is not None and (now - start_ts) >= 30.0:
                 resent_once = True
                 try:
@@ -310,7 +331,7 @@ async def _wait_for_code(
                 if found:
                     return found
             except ValueError:
-                await _ensure_service_chat_cached(client, limit=20)
+                peer_holder["peer"] = await _resolve_service_peer(client)
             except asyncio.TimeoutError:
                 log.warning("Таймаут чтения сообщений 777000")
             except Exception as e:
@@ -345,13 +366,21 @@ async def create_new_session(
     preloaded_code: str | None = None,
     lolz_code_fetcher: Callable[[], Awaitable[str | None]] | None = None,
 ) -> TelegramClient:
+    try:
+        me_src = await asyncio.wait_for(client_for_code_receiving.get_me(), timeout=8)
+        if me_src and getattr(me_src, "phone", None):
+            phone = me_src.phone
+    except Exception:
+        pass
     phone = _normalize_phone(phone)
 
     baseline_msg_id = 0
+    last_msg_date = "—"
+    service_peer = None
     stale_lolz_code = None
     stale_lolz_known = False
     if not preloaded_code:
-        baseline_msg_id = await prepare_client_for_code(client_for_code_receiving)
+        baseline_msg_id, last_msg_date, service_peer = await prepare_client_for_code(client_for_code_receiving)
         if lolz_code_fetcher is not None:
             try:
                 stale_lolz_code = await asyncio.wait_for(lolz_code_fetcher(), timeout=8)
@@ -416,8 +445,17 @@ async def create_new_session(
     sent_holder = {"sent": sent}
 
     async def _resend_app_code():
-        log.info("Код не пришёл за 30с — повторяю send_code_request для %s", phone)
-        new_sent = await asyncio.wait_for(new_client.send_code_request(phone), timeout=15)
+        cur_sent = sent_holder["sent"]
+        cur_next = type(cur_sent.next_type).__name__ if getattr(cur_sent, "next_type", None) else "none"
+        if "App" in cur_next:
+            log.info("Код не пришёл за 30с — ResendCodeRequest для %s", phone)
+            new_sent = await asyncio.wait_for(
+                new_client(ResendCodeRequest(phone_number=phone, phone_code_hash=cur_sent.phone_code_hash)),
+                timeout=15,
+            )
+        else:
+            log.info("Код не пришёл за 30с — повторный send_code_request для %s", phone)
+            new_sent = await asyncio.wait_for(new_client.send_code_request(phone), timeout=15)
         new_type = type(new_sent.type).__name__
         if new_type == "SentCodeTypeApp":
             sent_holder["sent"] = new_sent
@@ -430,6 +468,7 @@ async def create_new_session(
         code = await _wait_for_code(
             client_for_code_receiving,
             baseline_msg_id=baseline_msg_id,
+            service_peer=service_peer,
             timeout=80,
             lolz_code_fetcher=lolz_code_fetcher,
             stale_lolz_code=stale_lolz_code,
@@ -437,10 +476,11 @@ async def create_new_session(
             on_resend=_resend_app_code,
         )
         if not code:
+            cur_id, cur_date = await _get_last_service_msg_info(client_for_code_receiving, service_peer)
             await new_client.disconnect()
             raise AccountPipelineError(
-                f"Код входа (sent.type={sent_type}, baseline={baseline_msg_id}) "
-                f"не прочитан из чата 777000 за 80 секунд"
+                f"Код входа (sent.type={sent_type}, baseline={baseline_msg_id} [{last_msg_date}], "
+                f"после={cur_id} [{cur_date}]) не прочитан из чата 777000 за 80 секунд"
             )
         log.info("Код получен: %s", code)
 
