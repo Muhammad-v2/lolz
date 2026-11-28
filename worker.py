@@ -269,7 +269,9 @@ class Worker:
 
             await self.send_log(f"🚪 #{item_id}: завершаю купленную сессию...")
             try:
-                await terminate_this_session(bought_client)
+                logout_ok, logout_info = await terminate_this_session(bought_client)
+                if not logout_ok:
+                    await self.send_log(f"⚠️ #{item_id}: не удалось завершить купленную сессию ({logout_info})")
             except Exception as e:
                 await self.send_log(f"⚠️ #{item_id}: не удалось завершить купленную сессию ({e})")
             bought_client = None
@@ -299,11 +301,11 @@ class Worker:
         finally:
             if new_client is not None:
                 try:
-                    await new_client.disconnect()
+                    await asyncio.wait_for(new_client.disconnect(), timeout=5)
                 except Exception:
                     pass
             if bought_client is not None:
                 try:
-                    await bought_client.disconnect()
+                    await asyncio.wait_for(bought_client.disconnect(), timeout=5)
                 except Exception:
                     pass
