@@ -1,11 +1,9 @@
-"""
-Обёртка над Lolz Market API через lztmarket / lztmarketapi.
-"""
 from __future__ import annotations
 
 import asyncio
 import logging
 
+import httpx
 from lztmarketapi import (
     APIError,
     AsyncLZTMarket,
@@ -16,22 +14,10 @@ from lztmarketapi import (
     SearchParams,
     StatusResponse,
 )
-from pydantic import BaseModel, ConfigDict
 
 from config import ALLOWED_ORIGINS, LOLZ_TOKEN, SECRET_WORD
 
 log = logging.getLogger("lolz_client")
-
-
-class _AnyResponse(BaseModel):
-    model_config = ConfigDict(extra="allow")
-
-    def to_dict(self) -> dict:
-        data = self.model_dump()
-        extra = getattr(self, "model_extra", None)
-        if extra:
-            data.update(extra)
-        return data
 
 
 def _describe_api_error(e: BaseException) -> str:
@@ -99,6 +85,7 @@ NAME_TO_ISO = {
 
 class LolzClient:
     def __init__(self, token: str = LOLZ_TOKEN):
+        self._token = token
         self._market = AsyncLZTMarket(token, locale="ru-RU")
 
     async def close(self):
@@ -131,8 +118,13 @@ class LolzClient:
 
     async def get_balance(self):
         try:
-            result = await self._market.general.request("GET", "/me", _AnyResponse)
-            data = result.to_dict()
+            async with httpx.AsyncClient(timeout=15) as http:
+                resp = await http.get(
+                    "https://api.lzt.market/me",
+                    headers={"Authorization": f"Bearer {self._token}", "Accept": "application/json"},
+                )
+                resp.raise_for_status()
+                data = resp.json()
             if data.get("balance") is not None:
                 return data["balance"]
             user = data.get("user")
@@ -213,33 +205,33 @@ class LolzClient:
         return data
 
     async def get_login_code(self, item_id: int) -> str | None:
-        """
-        Пытается получить код входа Telegram через Lolz API.
-        """
-        for endpoint in (f"/{item_id}/telegram-login-code", f"/{item_id}/login-code"):
-            try:
-                result = await self._market.general.request("GET", endpoint, _AnyResponse)
-                data = result.to_dict()
-
-                for key in ("code", "login_code", "telegram_code"):
-                    if data.get(key):
-                        return str(data[key]).strip()
-
-                codes = data.get("codes")
-                if isinstance(codes, list) and codes:
-                    first = codes[0]
-                    if isinstance(first, dict):
-                        val = first.get("code") or first.get("value")
-                        if val:
-                            return str(val).strip()
-                    elif first:
-                        return str(first).strip()
-            except Exception as e:
-                log.debug("Lolz API %s не сработал: %s", endpoint, e)
+        headers = {"Authorization": f"Bearer {self._token}", "Accept": "application/json"}
+        async with httpx.AsyncClient(timeout=12) as http:
+            for endpoint in (f"/{item_id}/telegram-login-code", f"/{item_id}/login-code"):
+                try:
+                    resp = await http.get(f"https://api.lzt.market{endpoint}", headers=headers)
+                    if resp.status_code != 200:
+                        continue
+                    data = resp.json()
+                    if not isinstance(data, dict):
+                        continue
+                    for key in ("code", "login_code", "telegram_code"):
+                        if data.get(key):
+                            return str(data[key]).strip()
+                    codes = data.get("codes")
+                    if isinstance(codes, list) and codes:
+                        first = codes[0]
+                        if isinstance(first, dict):
+                            val = first.get("code") or first.get("value")
+                            if val:
+                                return str(val).strip()
+                        elif first:
+                            return str(first).strip()
+                except Exception as e:
+                    log.debug("Lolz API %s не сработал: %s", endpoint, e)
         return None
 
     async def edit_item_price(self, item_id: int, price: float):
-        """Изменяет цену выставленного на продажу лота."""
         payload = {"price": float(price), "currency": "rub"}
         last_err = None
         for method in ("PUT", "POST"):
