@@ -1,6 +1,3 @@
-"""
-Фоновый цикл: поиск → покупка → сброс старых сессий → новая сессия → чистка → смена почты → продажа.
-"""
 from __future__ import annotations
 
 import asyncio
@@ -153,32 +150,38 @@ class Worker:
         bought_client = await connect_from_hex_dc(hex_key_bought, int(dc_id_bought))
         new_client = None
         try:
-            # 1) Сбрасываем старые чужие сессии ДО создания новой,
-            #    иначе ResetAuthorizationsRequest убьёт только что созданную сессию!
             await self.send_log(f"🔒 #{item_id}: завершаю старые чужие сессии...")
             await terminate_other_sessions(bought_client)
+            try:
+                await asyncio.wait_for(bought_client.disconnect(), timeout=5)
+                await asyncio.wait_for(bought_client.connect(), timeout=15)
+            except Exception as e:
+                log.warning("Переподключение bought_client после ResetAuthorizations: %s", e)
             await db.update_purchase_status(item_id, "sessions_terminated")
 
-            # 2) Создаём новую сессию с жёстким общим таймаутом 140с.
             await self.send_log(f"🆕 #{item_id}: запрашиваю код и создаю новую сессию...")
-            try:
-                new_client = await asyncio.wait_for(
-                    create_new_session(
-                        bought_client,
-                        phone,
-                        password=cloud_password,
-                        lolz_code_fetcher=lambda: self.lolz.get_login_code(item_id),
-                    ),
-                    timeout=140,
+            session_task = asyncio.create_task(
+                create_new_session(
+                    bought_client,
+                    phone,
+                    password=cloud_password,
+                    lolz_code_fetcher=lambda: self.lolz.get_login_code(item_id),
                 )
-            except asyncio.TimeoutError:
-                err_msg = "таймаут создания новой сессии (140с) — сокет Telegram завис"
+            )
+            done, pending = await asyncio.wait({session_task}, timeout=120)
+            if session_task in pending:
+                session_task.cancel()
+                await asyncio.wait({session_task}, timeout=5)
+                err_msg = "таймаут создания новой сессии (120с) — сокет Telegram завис"
                 await db.update_purchase_status(item_id, "error", err_msg)
                 await self.send_log(
                     f"❌ #{item_id}: {err_msg}. "
                     f"Купленная сессия НЕ завершена — доступ не потерян."
                 )
                 raise AccountPipelineError(err_msg)
+
+            try:
+                new_client = session_task.result()
             except AccountPipelineError as e:
                 await db.update_purchase_status(item_id, "error", str(e))
                 await self.send_log(
@@ -197,7 +200,6 @@ class Worker:
                 telegram_user_id=str(data.get("telegram_id") or data.get("telegramId") or ""),
             )
 
-            # 3) Чистим аккаунт и меняем почту через новую сессию.
             await self.send_log(f"🧹 #{item_id}: чищу чаты и контакты...")
             cleanup_report = await cleanup_account(new_client)
             await db.update_purchase_status(item_id, "cleaned")
@@ -215,7 +217,6 @@ class Worker:
             except Exception as e:
                 await self.send_log(f"⚠️ #{item_id}: ошибка смены почты ({e})")
 
-            # 4) Проверка спам-блока.
             check_spam = (await db.get_setting("check_spam_block")) != "0"
             if check_spam:
                 await self.send_log(f"🔍 #{item_id}: проверяю спам-блок...")
@@ -224,7 +225,6 @@ class Worker:
             else:
                 spam_status = "unknown"
 
-            # 5) Выставляем на продажу.
             sell_price = float(await db.get_setting("sell_price"))
             title_tpl = await db.get_setting("title_template")
             clean_code = (country_code or "?").lstrip("+")
