@@ -155,10 +155,6 @@ async def connect_from_hex_dc(hex_key: str, dc_id: int) -> TelegramClient:
 
 
 async def _resolve_service_peer(client: TelegramClient):
-    """
-    Возвращает entity или InputPeerUser для чата 777000,
-    проверяя основной список диалогов и архив (folder=1).
-    """
     try:
         return await asyncio.wait_for(client.get_input_entity(TELEGRAM_SERVICE_ID), timeout=4)
     except Exception:
@@ -173,7 +169,7 @@ async def _resolve_service_peer(client: TelegramClient):
                         return dialog.input_entity
                 return None
 
-            peer = await asyncio.wait_for(_scan(), timeout=20)
+            peer = await asyncio.wait_for(_scan(), timeout=15)
             if peer is not None:
                 return peer
         except Exception as e:
@@ -298,11 +294,22 @@ async def _wait_for_code(
                 return code_holder["code"]
         return None
 
+    async def _poll_top_dialogs() -> str | None:
+        dialogs = await client.get_dialogs(limit=15)
+        for d in dialogs:
+            if d.id == TELEGRAM_SERVICE_ID:
+                peer_holder["peer"] = d.input_entity
+                if d.message and await _check_message(d.message):
+                    return code_holder["code"]
+                break
+        return None
+
     loop = asyncio.get_running_loop()
     start_ts = loop.time()
     deadline = start_ts + timeout
     last_lolz_poll = 0.0
     last_catch_up = 0.0
+    last_dialogs_poll = 0.0
     resent_once = False
 
     try:
@@ -330,17 +337,29 @@ async def _wait_for_code(
                 found = await asyncio.wait_for(_poll_messages(), timeout=8)
                 if found:
                     return found
-            except ValueError:
-                peer_holder["peer"] = await _resolve_service_peer(client)
-            except asyncio.TimeoutError:
-                log.warning("Таймаут чтения сообщений 777000")
             except Exception as e:
-                log.warning("Ошибка опроса 777000: %s", e)
+                log.debug("Опрос 777000 через iter_messages: %s", e)
+                try:
+                    found = await asyncio.wait_for(_poll_top_dialogs(), timeout=8)
+                    if found:
+                        return found
+                except Exception:
+                    pass
+
+            # Раз в 6 секунд также проверяем верхние диалоги напрямую (на случай удалённого ранее чата)
+            if (now - last_dialogs_poll) >= 6.0:
+                last_dialogs_poll = now
+                try:
+                    found = await asyncio.wait_for(_poll_top_dialogs(), timeout=8)
+                    if found:
+                        return found
+                except Exception:
+                    pass
 
             if (
                 lolz_code_fetcher is not None
                 and stale_lolz_known
-                and (now - start_ts) >= 20.0
+                and (now - start_ts) >= 10.0
                 and (now - last_lolz_poll) >= 5.0
             ):
                 last_lolz_poll = now
@@ -384,7 +403,7 @@ async def create_new_session(
         if lolz_code_fetcher is not None:
             try:
                 stale_lolz_code = await asyncio.wait_for(lolz_code_fetcher(), timeout=8)
-                stale_lolz_known = stale_lolz_code is not None
+                stale_lolz_known = True
             except Exception:
                 stale_lolz_code = None
                 stale_lolz_known = False
@@ -414,10 +433,16 @@ async def create_new_session(
         await asyncio.wait_for(new_client.connect(), timeout=15)
         sent = await asyncio.wait_for(new_client.send_code_request(phone), timeout=15)
     except FloodWaitError as e:
-        await new_client.disconnect()
+        try:
+            await asyncio.wait_for(new_client.disconnect(), timeout=5)
+        except Exception:
+            pass
         raise AccountPipelineError(f"FloodWait при запросе кода: подожди {e.seconds}с") from e
     except Exception as e:
-        await new_client.disconnect()
+        try:
+            await asyncio.wait_for(new_client.disconnect(), timeout=5)
+        except Exception:
+            pass
         raise AccountPipelineError(f"Не удалось запросить код: {e}") from e
 
     sent_type = type(sent.type).__name__
@@ -436,7 +461,10 @@ async def create_new_session(
             log.warning("ResendCodeRequest не удался: %s", e)
 
     if sent_type != "SentCodeTypeApp" and not preloaded_code:
-        await new_client.disconnect()
+        try:
+            await asyncio.wait_for(new_client.disconnect(), timeout=5)
+        except Exception:
+            pass
         raise AccountPipelineError(
             f"Telegram отправил код через {sent_type} (не в чат 777000, next_type={next_type}). "
             f"Проверьте API_ID/API_HASH или параметры устройства."
@@ -477,7 +505,10 @@ async def create_new_session(
         )
         if not code:
             cur_id, cur_date = await _get_last_service_msg_info(client_for_code_receiving, service_peer)
-            await new_client.disconnect()
+            try:
+                await asyncio.wait_for(new_client.disconnect(), timeout=5)
+            except Exception:
+                pass
             raise AccountPipelineError(
                 f"Код входа (sent.type={sent_type}, baseline={baseline_msg_id} [{last_msg_date}], "
                 f"после={cur_id} [{cur_date}]) не прочитан из чата 777000 за 80 секунд"
@@ -495,28 +526,28 @@ async def create_new_session(
         )
     except SessionPasswordNeededError:
         if not password:
-            await new_client.disconnect()
+            await asyncio.wait_for(new_client.disconnect(), timeout=5)
             raise AccountPipelineError("На аккаунте 2FA, пароль неизвестен. Ставь фильтр «Пароль: Нет».")
         try:
             await asyncio.wait_for(new_client.sign_in(password=password), timeout=15)
         except PasswordHashInvalidError as e:
-            await new_client.disconnect()
+            await asyncio.wait_for(new_client.disconnect(), timeout=5)
             raise AccountPipelineError("Неверный облачный пароль (2FA)") from e
         except Exception as e:
-            await new_client.disconnect()
+            await asyncio.wait_for(new_client.disconnect(), timeout=5)
             raise AccountPipelineError(f"Не удалось войти с 2FA: {e}") from e
     except (PhoneCodeInvalidError, PhoneCodeExpiredError) as e:
-        await new_client.disconnect()
+        await asyncio.wait_for(new_client.disconnect(), timeout=5)
         raise AccountPipelineError(f"Полученный код ({code}) не подошёл или истёк: {e}") from e
     except FloodWaitError as e:
-        await new_client.disconnect()
+        await asyncio.wait_for(new_client.disconnect(), timeout=5)
         raise AccountPipelineError(f"FloodWait при sign_in: {e.seconds}с") from e
     except Exception as e:
-        await new_client.disconnect()
+        await asyncio.wait_for(new_client.disconnect(), timeout=5)
         raise AccountPipelineError(f"Не удалось войти новой сессией: {e}") from e
 
     if not await asyncio.wait_for(new_client.is_user_authorized(), timeout=15):
-        await new_client.disconnect()
+        await asyncio.wait_for(new_client.disconnect(), timeout=5)
         raise AccountPipelineError("Новая сессия не авторизована после sign_in")
 
     me = await asyncio.wait_for(new_client.get_me(), timeout=15)
@@ -535,16 +566,27 @@ async def get_auth_hex_and_dc(client: TelegramClient) -> tuple[str, int]:
     return hex_key, dc_id
 
 
-async def terminate_this_session(client: TelegramClient) -> None:
-    try:
-        await asyncio.wait_for(client(LogOutRequest()), timeout=10)
-        log.info("Купленная сессия завершена (LogOut)")
-    except Exception as e:
-        log.warning("LogOut купленной сессии: %s", e)
+async def terminate_this_session(client: TelegramClient) -> tuple[bool, str]:
+    ok = False
+    err_msg = "неизвестная ошибка"
+    for attempt in range(2):
+        try:
+            if not client.is_connected():
+                await asyncio.wait_for(client.connect(), timeout=10)
+            await asyncio.wait_for(client(LogOutRequest()), timeout=10)
+            log.info("Купленная сессия завершена (LogOut)")
+            ok = True
+            err_msg = "ok"
+            break
+        except Exception as e:
+            err_msg = str(e)
+            log.warning("LogOut купленной сессии (попытка %s): %s", attempt + 1, e)
+            await asyncio.sleep(1.0)
     try:
         await asyncio.wait_for(client.disconnect(), timeout=5)
     except Exception:
         pass
+    return ok, err_msg
 
 
 async def cleanup_account(client: TelegramClient) -> dict:
